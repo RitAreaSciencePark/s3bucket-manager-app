@@ -59,7 +59,7 @@ flowchart TB
 | **Infra namespace** | `authentik-bucket-explorer` |
 | **App namespace** | `bucket-explorer` |
 | **Scripts call each other?** | **No** — deploy infra first, then app |
-| **Image registry** | `ghcr.io/<owner>/buckets-explorer-{backend,frontend}:latest` (private packages supported through `ghcr-pull-secret`) |
+| **Image registry** | `ghcr.io/<owner>/buckets-explorer-{backend,frontend}:latest` (public pull; push needs token) |
 | **Environment overlays** | Always `k8s/env/dev/` (scripts do not accept a `--env` flag today) |
 
 **Deployment host** — machine with the git clone, `podman`, `kubectl`, SSH to K3s nodes, and `k8s/.env`. This is where you run `app.sh` and `infra.sh`.
@@ -78,7 +78,7 @@ Every requirement below must pass before you deploy. Each row explains **what**,
 | **`podman`** | Builds and pushes container images | `command -v podman` | Install podman |
 | **`kubectl`** | Applies manifests; scripts invoke it | `command -v kubectl` | Install kubectl |
 | **SSH to K3s node** | Fetch kubeconfig; API tunnel when port 6443 is firewalled | `ssh -o ConnectTimeout=5 root@<kube01-ip> true` | Fix SSH keys / network |
-| **`k8s/.env` with `GHCR_TOKEN`** | Push images and create the private-package pull secret | `grep GHCR_TOKEN k8s/.env` (not placeholder) | Copy `k8s/.env.example` → `.env`; create PAT with `read:packages` + `write:packages` |
+| **`k8s/.env` with `GHCR_TOKEN`** | **Push** images to GHCR (`app.sh` only) | `grep GHCR_TOKEN k8s/.env` (not placeholder) | Copy `k8s/.env.example` → `.env`; create PAT with `write:packages` |
 | **`k8s/env/dev/app-secrets*.yaml`** | Django secret key, OIDC secret, DB password | `ls k8s/env/dev/app-secrets.local.yaml` or `app-secrets.yaml` | Copy template; fill `CHANGE_ME_*` values |
 | **`k8s/env/dev/backend-config*.yaml`** | S3 endpoint, Authentik URLs, RGWSquared URL | `ls k8s/env/dev/backend-config.local.yaml` or `backend-config.yaml` | Copy template; set endpoints |
 | **`k8s/env/dev/infra-secrets*.yaml`** | Authentik bootstrap secrets | `ls k8s/env/dev/infra-secrets.local.yaml` or `infra-secrets.yaml` | Copy template; fill secrets |
@@ -110,12 +110,15 @@ export KUBECONFIG=/tmp/k3s-tunnel-kubeconfig.yaml
 ### GHCR token setup
 
 Only **`app.sh`** reads `GHCR_TOKEN` (from gitignored `k8s/.env`). It creates or
-refreshes `ghcr-pull-secret` before applying the application deployments.
+refreshes `ghcr-pull-secret` and attaches it to the namespace's default
+service account before applying the application deployments — the GHCR
+packages are public today, but the pull secret is set up unconditionally
+so the cluster keeps working if a package is ever switched to private.
 
 ```bash
 cd k8s
 cp .env.example .env
-# Edit .env — classic PAT with read:packages + write:packages scopes:
+# Edit .env — classic PAT with write:packages scope:
 # https://github.com/settings/tokens/new?scopes=write:packages
 ```
 

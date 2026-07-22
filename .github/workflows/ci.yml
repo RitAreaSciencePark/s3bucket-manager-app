@@ -1,22 +1,22 @@
-# ci.yml — Verification gate + continuous deployment to dev K3s
+# ci.yml — Verification gate (tests, build, Codecov)
 #
-# verify  : pytest + coverage + frontend build on every push/PR to dev and main
-# deploy-dev : build/push images and roll out to dev cluster (push to dev only)
+# verify: pytest + coverage + frontend build on every push/PR to main
 #
-# Required GitHub repository secrets:
-#   GHCR_TOKEN    — classic PAT with write:packages (deploy-dev job)
-#   CODECOV_TOKEN — Codecov repository upload token (verify job; optional but recommended)
+# Dev deploy is manual on the operator host:
+#   cd k8s && ./app.sh deploy --rebuild
+# Image push uses GHCR_TOKEN in k8s/.env (see k8s/.env.example), not GitHub Actions secrets.
+#
+# Optional repository secret:
+#   CODECOV_TOKEN — Codecov upload token (verify job; optional but recommended)
 
 name: CI
 
 on:
   push:
     branches:
-      - dev
       - main
   pull_request:
     branches:
-      - dev
       - main
 
 jobs:
@@ -46,7 +46,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -62,60 +62,3 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: backend/coverage.xml
           fail_ci_if_error: false
-
-  deploy-dev:
-    name: Deploy to K3s (dev)
-    needs: verify
-    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Login to GHCR
-        run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u luisfpal --password-stdin
-
-      - name: Build and push backend
-        run: |
-          docker build -t ghcr.io/luisfpal/buckets-explorer-backend:latest \
-            -f backend/Containerfile backend/
-          docker push ghcr.io/luisfpal/buckets-explorer-backend:latest
-
-      - name: Build and push frontend
-        run: |
-          docker build -t ghcr.io/luisfpal/buckets-explorer-frontend:latest \
-            -f frontend/Containerfile frontend/
-          docker push ghcr.io/luisfpal/buckets-explorer-frontend:latest
-
-  deploy-dev-k8s:
-    name: Roll out dev cluster
-    needs: deploy-dev
-    runs-on: bucket-explorer-runner
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Apply manifests
-        run: |
-          kubectl apply -f k8s/manifests/app/00-namespace.yaml
-          kubectl apply -f k8s/manifests/app/01-django-postgres.yaml
-          kubectl apply -f k8s/manifests/app/02-backend.yaml
-          kubectl apply -f k8s/manifests/app/03-frontend.yaml
-
-      - name: Restart deployments to pull new images
-        run: |
-          kubectl rollout restart deployment/backend deployment/frontend -n bucket-explorer
-
-      - name: Wait for rollout
-        run: |
-          kubectl rollout status deployment/backend -n bucket-explorer --timeout=300s
-          kubectl rollout status deployment/frontend -n bucket-explorer --timeout=300s
-
-      - name: Apply dev ingress (if HAProxy IngressClass present)
-        run: |
-          if kubectl get ingressclass haproxy-4 &>/dev/null 2>&1; then
-            kubectl apply -f k8s/manifests/app/04-ingress.dev.yaml
-            echo "Dev ingress applied"
-          else
-            echo "haproxy-4 IngressClass not found — skipping dev ingress"
-          fi
