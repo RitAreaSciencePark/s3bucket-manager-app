@@ -9,7 +9,9 @@ import io
 import logging
 
 from django.contrib.auth import login as django_login
+from django.db import transaction
 from django.db.models import Count, Q, Sum
+from django.utils import timezone
 from drf_spectacular.utils import extend_schema, OpenApiResponse
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes, throttle_classes
@@ -45,7 +47,10 @@ from storage.services.rgw_squared import (
 )
 from storage.access import (
     NFFADI_AUTHENTIK_GROUP,
+    configured_tenant_ids,
+    current_authentik_groups,
     is_nffadi_tenant,
+    is_rgwsquared_synced,
     suggested_group_name,
     WRITE_CAPABLE_ROLES,
 )
@@ -379,6 +384,15 @@ def admin_users(request):
             for row in file_aggs
         }
 
+        configured_ids = configured_tenant_ids()
+
+        def access_status(membership):
+            if membership.access_revoked_at is not None:
+                return "revoked"
+            if membership.tenant_id not in configured_ids:
+                return "not_configured"
+            return "authorized"
+
         return Response(
             [
                 {
@@ -393,6 +407,10 @@ def admin_users(request):
                     "tenant_name": m.tenant.name,
                     "role": m.role,
                     "uo_code": m.uo_code,
+                    "access_status": access_status(m),
+                    "access_revoked_at": m.access_revoked_at,
+                    "access_revocation_reason": m.access_revocation_reason,
+                    "access_revoked_group": m.access_revoked_group,
                     "last_login": m.user.last_login,
                     "file_count": file_stats.get((m.user.id, m.tenant.id), (0, 0))[0],
                     "total_file_size": file_stats.get(
@@ -571,8 +589,9 @@ def admin_tenant_activation(request):
             has_group_mapping = bool(mappings)
             initialized = status_info.get("initialized")
             nffadi_policy = bool(tenant and is_nffadi_tenant(tenant)) or code.upper() == "NFFADI"
+            rgwsquared_policy = bool(tenant and is_rgwsquared_synced(tenant))
             required_group_name = NFFADI_AUTHENTIK_GROUP if nffadi_policy else None
-            role_source = "rgwsquared" if nffadi_policy else "authentik_group"
+            role_source = "rgwsquared" if rgwsquared_policy else "authentik_group"
             group_mapping_ready = has_group_mapping
             group_mapping_issue = ""
             if nffadi_policy:
@@ -581,7 +600,13 @@ def admin_tenant_activation(request):
                 if not mappings:
                     group_mapping_issue = f"Add exactly one mapping: {NFFADI_AUTHENTIK_GROUP}"
                 elif not group_mapping_ready:
-                    group_mapping_issue = f"NFFADI must have exactly one RW mapping named {NFFADI_AUTHENTIK_GROUP}"
+                    group_mapping_issue = f"NFFADI must have exactly one eligibility mapping named {NFFADI_AUTHENTIK_GROUP}"
+            elif rgwsquared_policy:
+                group_mapping_ready = len(mappings) == 1
+                if not mappings:
+                    group_mapping_issue = "Add exactly one Authentik eligibility mapping"
+                elif not group_mapping_ready:
+                    group_mapping_issue = "RGWSquared-synced tenants require exactly one eligibility mapping"
 
             fully_active = bool(
                 initialized is True
@@ -610,6 +635,7 @@ def admin_tenant_activation(request):
                     "group_mapping_ready": group_mapping_ready,
                     "group_mapping_issue": group_mapping_issue,
                     "required_group_name": required_group_name,
+                    "access_model": tenant.access_model if tenant else None,
                     "role_source": role_source,
                     "suggested_rw_group": suggested_group_name(code, "rw"),
                     "suggested_ro_group": suggested_group_name(code, "ro"),
@@ -677,15 +703,15 @@ def admin_group_mappings(request):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    if is_nffadi_tenant(tenant):
-        if group != NFFADI_AUTHENTIK_GROUP:
+    if is_rgwsquared_synced(tenant):
+        if is_nffadi_tenant(tenant) and group != NFFADI_AUTHENTIK_GROUP:
             return Response(
                 {"error": f"NFFADI must use Authentik group '{NFFADI_AUTHENTIK_GROUP}'."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         if role != "rw":
             return Response(
-                {"error": "NFFADI mapping role must be rw; user role is decided by RGWSquared."},
+                {"error": "RGWSquared-synced mappings are eligibility gates; roles come from RGWSquared."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         existing = GroupTenantMapping.objects.filter(tenant=tenant).first()
@@ -693,14 +719,13 @@ def admin_group_mappings(request):
             return Response(
                 {
                     "error": (
-                        f'Tenant {tenant.code} already has group mapping '
+                        f'Tenant {tenant.code} already has eligibility mapping '
                         f'"{existing.authentik_group}". Remove it first.'
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
     else:
-        # Non-NFFADI tenants can have at most one rw group and one ro group.
         existing = GroupTenantMapping.objects.filter(tenant=tenant, role=role).first()
         if existing:
             return Response(
@@ -732,12 +757,78 @@ def admin_group_mappings(request):
 @api_view(["DELETE"])
 @permission_classes([AdminPanelPermission])
 def admin_group_mapping_delete(request, mapping_id):
-    """Delete a group-tenant mapping."""
-    deleted, _ = GroupTenantMapping.objects.filter(id=mapping_id).delete()
-    if not deleted:
-        return Response(
-            {"error": "Mapping not found"}, status=status.HTTP_404_NOT_FOUND
+    """Delete a group mapping and revoke only access derived from it."""
+    with transaction.atomic():
+        try:
+            mapping = (
+                GroupTenantMapping.objects.select_for_update()
+                .select_related("tenant")
+                .get(id=mapping_id)
+            )
+        except GroupTenantMapping.DoesNotExist:
+            return Response(
+                {"error": "Mapping not found"}, status=status.HTTP_404_NOT_FOUND
+            )
+
+        tenant = mapping.tenant
+        removed_group = mapping.authentik_group
+        mapping.delete()
+        remaining = list(GroupTenantMapping.objects.filter(tenant=tenant))
+        revoked = 0
+        downgraded = 0
+        now = timezone.now()
+
+        memberships = (
+            TenantMembership.objects.select_for_update()
+            .select_related("user")
+            .filter(
+                tenant=tenant,
+                is_active=True,
+                access_revoked_at__isnull=True,
+            )
         )
+        for membership in memberships:
+            if is_rgwsquared_synced(tenant) or not remaining:
+                should_revoke = True
+                fallback = None
+            else:
+                groups = current_authentik_groups(membership.user)
+                if removed_group not in groups:
+                    continue
+                matches = [m for m in remaining if m.authentik_group in groups]
+                fallback = next((m for m in matches if m.role == "rw"), None)
+                if fallback is None and matches:
+                    fallback = matches[0]
+                should_revoke = fallback is None
+
+            if should_revoke:
+                membership.access_revoked_at = now
+                membership.access_revocation_reason = "mapping_removed"
+                membership.access_revoked_group = removed_group
+                membership.save(
+                    update_fields=[
+                        "access_revoked_at",
+                        "access_revocation_reason",
+                        "access_revoked_group",
+                    ]
+                )
+                revoked += 1
+            elif membership.role != fallback.role:
+                membership.role = fallback.role
+                update_fields = ["role"]
+                if fallback.role == "ro" and membership.uo_code:
+                    membership.uo_code = ""
+                    update_fields.append("uo_code")
+                membership.save(update_fields=update_fields)
+                downgraded += 1
+
+    logger.info(
+        "Removed group mapping %s -> %s; revoked=%s role_changed=%s",
+        removed_group,
+        tenant.code,
+        revoked,
+        downgraded,
+    )
     return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -983,10 +1074,25 @@ def admin_create_tenant(request):
     structure = request.data.get("structure", "").strip()
     name = request.data.get("name", "").strip()
     bucket_prefix = request.data.get("bucket_name_prefix", "").strip()
+    access_model = request.data.get("access_model", "").strip()
 
     if not structure or not name:
         return Response(
             {"error": "structure and name are required"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if access_model not in dict(Tenant.ACCESS_MODEL_CHOICES):
+        return Response(
+            {"error": "access_model must be 'rgwsquared_synced' or 'authentik_managed'"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if (
+        structure.upper() == "NFFADI"
+        and access_model != Tenant.RGWSQUARED_SYNCED
+    ):
+        return Response(
+            {"error": "NFFADI requires the rgwsquared_synced access model"},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -1001,6 +1107,7 @@ def admin_create_tenant(request):
         name=name,
         rgwsquared_structure=structure,
         bucket_name_prefix=bucket_prefix,
+        access_model=access_model,
         is_active=True,
     )
     logger.info(f"Created tenant: {tenant.code} ({tenant.name})")
@@ -1035,6 +1142,7 @@ def admin_create_tenant(request):
             "name": tenant.name,
             "rgwsquared_structure": tenant.rgwsquared_structure,
             "bucket_name_prefix": tenant.bucket_name_prefix,
+            "access_model": tenant.access_model,
             "sync_stats": sync_stats,
             "sync_error": sync_error,
         },

@@ -15,11 +15,16 @@ from storage.models import (
     TenantMembership,
     Bucket,
     BucketPermission,
+    FileUploadRecord,
     User,
 )
 from storage.services.rgw_squared import RGWSquaredClient
-from storage.services.s3_ops import parse_rgwsquared_bucket_name
-from storage.access import is_write_capable
+from storage.services.s3_ops import (
+    get_mgmt_s3_client,
+    list_objects,
+    parse_rgwsquared_bucket_name,
+)
+from storage.access import is_rgwsquared_synced, is_write_capable
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +57,15 @@ def refresh_local_cache(tenant, client=None):
     structure = tenant.rgwsquared_structure
     stats = {
         "users_synced": 0,
+        "users_skipped_unregistered": 0,
         "buckets_synced": 0,
         "permissions_synced": 0,
         "orphan_buckets_seen": 0,
         "orphan_permissions_cleared": 0,
+        "objects_synced": 0,
+        "objects_discovered": 0,
+        "object_records_removed": 0,
+        "object_sync_errors": 0,
     }
     synced_ceph_usernames = set()
     proposal_bucket_ids_by_name = {}
@@ -117,9 +127,20 @@ def refresh_local_cache(tenant, client=None):
                 stats["orphan_permissions_cleared"] += cleared
         stats["buckets_synced"] += 1
 
+    rgwsquared_authoritative = is_rgwsquared_synced(tenant)
     ms_users = client.list_users(structure)
     for username in ms_users:
         synced_ceph_usernames.add(username)
+        if rgwsquared_authoritative:
+            user = _resolve_user_for_identity(username, tenant, structure, stats)
+            membership = None
+        else:
+            membership = _registered_membership_for_identity(username, tenant)
+            if membership is None:
+                stats["users_skipped_unregistered"] += 1
+                continue
+            user = membership.user
+
         try:
             user_info = client.get_user_info(structure, username)
         except Exception as e:
@@ -142,17 +163,26 @@ def refresh_local_cache(tenant, client=None):
         }
         role = "rw" if user_perms["rw"] else "ro"
 
-        user = _resolve_user_for_identity(username, tenant, structure, stats)
-
-        membership, _ = TenantMembership.objects.update_or_create(
-            user=user,
-            tenant=tenant,
-            defaults={
-                "ceph_username": username,
-                "role": role,
-                "is_active": True,
-            },
-        )
+        if rgwsquared_authoritative:
+            membership, _ = TenantMembership.objects.update_or_create(
+                user=user,
+                tenant=tenant,
+                defaults={
+                    "ceph_username": username,
+                    "role": role,
+                    "is_active": True,
+                },
+            )
+        else:
+            update_fields = []
+            if membership.ceph_username != username:
+                membership.ceph_username = username
+                update_fields.append("ceph_username")
+            if not membership.is_active:
+                membership.is_active = True
+                update_fields.append("is_active")
+            if update_fields:
+                membership.save(update_fields=update_fields)
 
         # UO codes are only for write-capable users; RO users must not carry them.
         if not is_write_capable(membership.role):
@@ -179,43 +209,63 @@ def refresh_local_cache(tenant, client=None):
                 )
 
         stats["users_synced"] += 1
-
         synced_count = _sync_user_permissions(
             user, tenant, user_perms["rw"], user_perms["ro"]
         )
         stats["permissions_synced"] += synced_count
 
-    # Remove only RGWSquared-derived access; local sharing is user-managed state.
-    stale_memberships = (
-        TenantMembership.objects.filter(
-            tenant=tenant,
-            is_active=True,
+    # Only RGWSquared-authoritative tenants deactivate memberships when an
+    # upstream user disappears. Authentik-managed membership truth comes from OIDC.
+    if rgwsquared_authoritative:
+        stale_memberships = (
+            TenantMembership.objects.filter(
+                tenant=tenant,
+                is_active=True,
+            )
+            .exclude(ceph_username__in=synced_ceph_usernames)
+            .exclude(ceph_username="")
         )
-        .exclude(
-            ceph_username__in=synced_ceph_usernames,
-        )
-        .exclude(ceph_username="")
-    )
 
-    deactivated = 0
-    for m in stale_memberships:
-        perms_deleted, _ = BucketPermission.objects.filter(
-            user=m.user,
-            bucket__tenant=tenant,
-            source="rgwsquared",
-        ).delete()
-        m.is_active = False
-        m.save(update_fields=["is_active"])
-        logger.info(
-            f"Deactivated stale membership: {m.ceph_username} in {tenant.code} ({perms_deleted} perms removed)"
-        )
-        deactivated += 1
+        deactivated = 0
+        for membership in stale_memberships:
+            perms_deleted, _ = BucketPermission.objects.filter(
+                user=membership.user,
+                bucket__tenant=tenant,
+                source="rgwsquared",
+            ).delete()
+            membership.is_active = False
+            membership.save(update_fields=["is_active"])
+            logger.info(
+                "Deactivated stale membership: %s in %s (%s perms removed)",
+                membership.ceph_username,
+                tenant.code,
+                perms_deleted,
+            )
+            deactivated += 1
 
-    if deactivated:
-        stats["users_deactivated"] = deactivated
+        if deactivated:
+            stats["users_deactivated"] = deactivated
 
+    _sync_authorized_bucket_objects(tenant, stats, client)
     return stats
 
+
+
+def _registered_membership_for_identity(identity, tenant):
+    """Resolve only users who already registered through a successful OIDC login."""
+    username = str(identity).strip()
+    if not username:
+        return None
+    return (
+        TenantMembership.objects.filter(
+            tenant=tenant,
+            ceph_username=username,
+            user__external_id__isnull=False,
+        )
+        .exclude(user__external_id__startswith="ms:")
+        .select_related("user")
+        .first()
+    )
 
 def _resolve_user_for_identity(identity, tenant, structure, stats):
     """Map a RGWSquared username or email to a Django User."""
@@ -231,13 +281,32 @@ def _resolve_user_for_identity(identity, tenant, structure, stats):
     if membership:
         return membership.user
 
-    if "@" in username:
-        user = (
-            User.objects.filter(email=username).first()
-            or User.objects.filter(username=username).first()
+    user = User.objects.filter(username=username).first()
+
+    if not user:
+        from social_django.models import UserSocialAuth
+
+        associations = list(
+            UserSocialAuth.objects.filter(
+                provider="authentik",
+                extra_data__preferred_username=username,
+            )
+            .select_related("user")
+            .order_by("id")[:2]
         )
-    else:
-        user = User.objects.filter(username=username).first()
+        if len(associations) == 1:
+            user = associations[0].user
+
+    if not user and "@" in username:
+        email_matches = list(User.objects.filter(email__iexact=username).order_by("id")[:2])
+        if len(email_matches) == 1:
+            user = email_matches[0]
+        elif len(email_matches) > 1:
+            logger.warning(
+                "Cannot resolve RGWSquared identity %s by non-unique email in %s",
+                username,
+                structure,
+            )
 
     if not user:
         email = username if "@" in username else f"{username}@placeholder.local"
@@ -252,6 +321,99 @@ def _resolve_user_for_identity(identity, tenant, structure, stats):
         stats["users_created"] = stats.get("users_created", 0) + 1
 
     return user
+
+
+def _sync_authorized_bucket_objects(tenant, stats, rgwsquared_client):
+    """Reconcile object metadata for buckets with trusted application access."""
+    buckets = list(
+        Bucket.objects.filter(tenant=tenant, permissions__isnull=False)
+        .distinct()
+        .order_by("id")
+    )
+    if not buckets:
+        return
+
+    try:
+        s3 = get_mgmt_s3_client(tenant, client=rgwsquared_client)
+    except Exception as exc:
+        logger.warning("Could not create S3 client for %s object sync: %s", tenant.code, exc)
+        stats["object_sync_errors"] += len(buckets)
+        return
+
+    for bucket in buckets:
+        try:
+            objects = list_objects(s3, bucket.name, raise_errors=True)
+        except Exception as exc:
+            logger.warning(
+                "Could not inventory objects in %s/%s: %s",
+                tenant.code,
+                bucket.name,
+                exc,
+            )
+            stats["object_sync_errors"] += 1
+            continue
+
+        existing = {
+            record.file_key: record
+            for record in FileUploadRecord.objects.filter(bucket=bucket)
+        }
+        seen_keys = set()
+        to_create = []
+        to_update = []
+
+        for item in objects:
+            key = item["key"]
+            etag = item.get("etag", "")
+            seen_keys.add(key)
+            record = existing.get(key)
+            if record is None:
+                to_create.append(
+                    FileUploadRecord(
+                        bucket=bucket,
+                        file_key=key,
+                        uploaded_by=None,
+                        file_size=item["size"],
+                        origin=FileUploadRecord.DISCOVERED,
+                        object_etag=etag,
+                        object_last_modified=item["last_modified"],
+                    )
+                )
+                stats["objects_discovered"] += 1
+                continue
+
+            changed_outside_app = bool(record.object_etag and etag) and (
+                record.object_etag != etag
+            )
+            if changed_outside_app and record.origin == FileUploadRecord.APP:
+                record.uploaded_by = None
+                record.origin = FileUploadRecord.DISCOVERED
+                stats["objects_discovered"] += 1
+            record.file_size = item["size"]
+            record.object_etag = etag
+            record.object_last_modified = item["last_modified"]
+            to_update.append(record)
+
+        if to_create:
+            FileUploadRecord.objects.bulk_create(to_create)
+        if to_update:
+            FileUploadRecord.objects.bulk_update(
+                to_update,
+                [
+                    "uploaded_by",
+                    "file_size",
+                    "origin",
+                    "object_etag",
+                    "object_last_modified",
+                ],
+            )
+
+        stale_ids = [
+            record.id for key, record in existing.items() if key not in seen_keys
+        ]
+        if stale_ids:
+            removed, _ = FileUploadRecord.objects.filter(id__in=stale_ids).delete()
+            stats["object_records_removed"] += removed
+        stats["objects_synced"] += len(objects)
 
 
 def _cleanup_orphan_manual_bucket(bucket):

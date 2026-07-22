@@ -185,31 +185,24 @@ The catch-all dev ingress accepts any hostname, so `localhost:3000` (tunnelled t
 
 ### Container Registry (GHCR)
 
-Container images are published to the **GitHub Container Registry** (`ghcr.io/luisfpal/...`) as public packages. K3s nodes pull images without authentication because the packages are public. The developer pushes images using a classic GitHub PAT with `write:packages` scope, stored in `k8s/.env` (gitignored).
+Container images are published to the **GitHub Container Registry**
+(`ghcr.io/luisfpal/...`). The developer uses a classic GitHub PAT with
+`read:packages` and `write:packages` scopes, stored in `k8s/.env` (gitignored).
+`app.sh` converts that login into a namespace-scoped Kubernetes pull secret, so
+the same workflow supports private packages without embedding credentials in manifests.
 
-This replaced the local Stencil registry (`registry.stencil.com:5000`) used in the original Stencil setup. GHCR was chosen because images are accessible from any environment — production K3s nodes can pull the same image as development nodes without configuring a registry mirror.
+This replaced the local Stencil registry (`registry.stencil.com:5000`) used in the original Stencil setup. GHCR lets development and production pull the same immutable image without configuring a registry mirror.
 
-### GitHub Actions Runners (ARC)
+### GitHub Actions (verify only)
 
-The repository includes a CI/CD pipeline (`.github/workflows/ci.yml`) that runs tests on every push/PR and automatically builds and deploys to the dev cluster when code is pushed to the `dev` branch.
+The repository workflow [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs **verify** on every push/PR to `main`: pytest, frontend build, and optional Codecov upload. It does **not** deploy.
 
-The pipeline has two jobs:
+Dev deploy is manual on the operator host — see [Development deployment operations](dev-deployment-operations.md).
 
-```
-Push to dev
-  │
-  ▼
-Job 1: Build (GitHub-hosted ubuntu-latest runner)
-  │  docker build backend, frontend → push to GHCR
-  ▼
-Job 2: Deploy (self-hosted runner inside K3s)
-  │  kubectl apply manifests
-  │  kubectl rollout restart
-  ▼
-  New pods pull fresh images from GHCR and roll out
-```
+### GitHub Actions Runners (ARC, optional)
 
-The self-hosted runner is deployed inside K3s using **ARC** (Actions Runner Controller), a Kubernetes operator that manages GitHub Actions runner pods. ARC is installed via `k8s/ci.sh`. The runner pod uses a ServiceAccount bound to the minimum RBAC permissions needed to deploy to the `bucket-explorer` namespace only.
+**ARC** (Actions Runner Controller) can install a self-hosted runner inside K3s via `k8s/ci.sh` (requires `GITHUB_PAT` with `repo` scope). Optional; not required for green CI or day-to-day dev when you deploy with `app.sh`.
+
 
 ---
 
@@ -255,7 +248,7 @@ The production cluster at AREA Science Park differs in only these respects:
 | Kubernetes            | K3s (Stencil cluster)                     | K3s or full K8s (production cluster)         |
 | Ingress               | haproxy-4 (self-installed)               | haproxy-4 (platform-managed)                 |
 | S3 endpoint           | 198.51.100.110 (self-signed TLS)        | Production Ceph RGW (trusted TLS)            |
-| Registry              | GHCR public packages                      | GHCR public packages (same)                  |
+| Registry              | GHCR images + namespace pull secret        | GHCR images + namespace pull secret          |
 | Identity              | Authentik in-cluster                      | Authentik (platform-managed)                 |
 | TLS                   | Self-signed, `S3_VERIFY_SSL=False`        | Trusted CA, `S3_VERIFY_SSL=True`             |
 | Config                | `k8s/env/dev/*.local.yaml`               | `k8s/env/prod/*.local.yaml` + secret manager |

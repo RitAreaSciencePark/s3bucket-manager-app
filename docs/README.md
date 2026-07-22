@@ -16,6 +16,7 @@ Files in `docs/` are **public**: they must be self-contained so another operator
 | --- | --- |
 | [Development environment setup](dev-environment-setup.md) | Provision K3s, Ceph, Authentik, and deploy the app from scratch |
 | [Development environment overview](dev-environment-overview.md) | Stencil topology, networking, and how components connect |
+| [Development deployment operations](dev-deployment-operations.md) | Day-to-day deploy and updates with `k8s/app.sh` and `k8s/infra.sh` |
 
 ## Maintain the application
 
@@ -39,5 +40,5 @@ Files in `docs/` are **public**: they must be self-contained so another operator
 
 | Environment | Tooling |
 | --- | --- |
-| Development (Stencil K3s) | `k8s/infra.sh`, `k8s/app.sh`, SSH tunnel to `orfeo-vm` |
+| Development (Stencil K3s) | `k8s/infra.sh`, `k8s/app.sh` — see [dev-deployment-operations.md](dev-deployment-operations.md) |
 | Production | Manual `kubectl apply` ladder; see [production-deployment.md](production-deployment.md) |

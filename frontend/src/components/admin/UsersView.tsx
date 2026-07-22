@@ -149,6 +149,7 @@ function UsersView() {
                 <th>Email</th>
                 <th>Tenant</th>
                 <th>Role</th>
+                <th>Access</th>
                 <th>UO Code</th>
                 <th
                   style={{ cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap' }}
@@ -162,7 +163,7 @@ function UsersView() {
             </thead>
             <tbody>
               {loadingUsers ? (
-                <tr><td colSpan={8} className="admin-empty">Loading users...</td></tr>
+                <tr><td colSpan={9} className="admin-empty">Loading users...</td></tr>
               ) : filtered.map((u) => {
                 const isExpanded = expandedMembershipId === u.membership_id
                 const files = membershipFiles[u.membership_id]
@@ -181,6 +182,19 @@ function UsersView() {
                       <td>{u.email || '—'}</td>
                       <td>{u.tenant_code}</td>
                       <td><span className={`permission-badge permission-${u.role}`}>{u.role.toUpperCase()}</span></td>
+                      <td>
+                        <span
+                          className={`permission-badge permission-${u.access_status === 'authorized' ? 'rw' : 'ro'}`}
+                          style={u.access_status === 'not_configured' ? { background: '#e2e8f0', color: '#475569' } : undefined}
+                          title={
+                            u.access_status === 'revoked'
+                              ? `${u.access_revocation_reason === 'mapping_removed' ? 'Group mapping removed' : 'Mapped group missing at login'}${u.access_revoked_group ? `: ${u.access_revoked_group}` : ''}${u.access_revoked_at ? ` · ${formatDate(u.access_revoked_at)}` : ''}`
+                              : undefined
+                          }
+                        >
+                          {u.access_status === 'authorized' ? 'AUTHORIZED' : u.access_status === 'revoked' ? 'REVOKED' : 'NOT CONFIGURED'}
+                        </span>
+                      </td>
                       <td>{u.uo_code || '—'}</td>
                       <td>
                         {u.total_file_size > 0 ? (
@@ -195,7 +209,7 @@ function UsersView() {
                     </tr>
                     {isExpanded && (
                       <tr>
-                        <td colSpan={8} style={{ padding: 0, background: '#f8fafc' }}>
+                        <td colSpan={9} style={{ padding: 0, background: '#f8fafc' }}>
                           <div style={{ padding: '0.75rem 1.5rem 0.75rem 2.5rem' }}>
                             {files === 'loading' ? (
                               <div style={{ color: '#94a3b8', fontSize: '0.85rem' }}>Loading files...</div>

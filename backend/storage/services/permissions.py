@@ -17,18 +17,28 @@ File deletion rule for shared buckets:
 
 import logging
 
-from storage.models import BucketPermission, FileUploadRecord
+from storage.access import membership_has_access
+from storage.models import BucketPermission, FileUploadRecord, TenantMembership
 
 logger = logging.getLogger(__name__)
 
 
 def get_user_permission(user, bucket):
     """Get user's permission level on a bucket. Returns 'owner'/'rw'/'ro'/None."""
+    membership = (
+        TenantMembership.objects.select_related("user", "tenant")
+        .filter(user=user, tenant=bucket.tenant, is_active=True)
+        .first()
+    )
+    if not membership or not membership_has_access(membership):
+        return None
     try:
-        perm = BucketPermission.objects.get(bucket=bucket, user=user)
-        return perm.permission
+        permission = BucketPermission.objects.get(bucket=bucket, user=user).permission
     except BucketPermission.DoesNotExist:
         return None
+    if membership.role == "ro" and permission in ("owner", "rw"):
+        return "ro"
+    return permission
 
 
 def can_view_bucket(user, bucket):
@@ -38,7 +48,7 @@ def can_view_bucket(user, bucket):
 
 def can_create_bucket(membership):
     """User can create local research buckets if they have RW or admin role."""
-    return membership.is_active and membership.role in ("rw", "admin")
+    return membership_has_access(membership) and membership.role in ("rw", "admin")
 
 
 def can_delete_bucket(user, bucket):

@@ -83,14 +83,10 @@ spec:
           ports:
             - containerPort: 8000
               name: http
-          # Django/gunicorn: CPU-bound (ORM queries, JSON serialization, OIDC token validation).
-          # Each gunicorn worker handles one request at a time; more workers = more concurrency.
-          # Worker formula: (2 × CPU cores available) + 1. Increase --workers in Containerfile
-          # CMD to match the PROD CPU limit (e.g. --workers 4 for 3 CPU, --workers 7 for 3 CPU max).
-          #
-          # DEV:  requests=250m/512Mi, limits=1000m/1Gi  → 2 workers; can burst to 1 CPU on idle node
-          # PROD: requests=500m/1Gi,   limits=3000m/4Gi  → 4+ workers; quota: ~3/8 CPU, ~4/32Gi memory
-          #       Also consider: --worker-class gthread --threads 2  for better IO concurrency
+          # Django/gunicorn: mostly IO-bound (OIDC, RGWSquared, S3). Keep 2 workers per pod
+          # (see backend/Containerfile); scale replicas, not workers. Startup runs migrate and
+          # collectstatic before gunicorn, so memory limit must cover that spike (~512Mi–1Gi).
+          # Prod values match dev: requests=250m/512Mi, limits=1000m/1Gi.
           resources:
             requests:
               memory: "512Mi"

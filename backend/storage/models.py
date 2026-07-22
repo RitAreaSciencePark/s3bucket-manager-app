@@ -82,7 +82,10 @@ class User(AbstractUser):
     )
 
     email = models.EmailField(
-        unique=True, help_text="Email address from IdP (OAuth2 'email' claim)"
+        help_text=(
+            "Email address from IdP (OAuth2 'email' claim). Not an identity key: "
+            "distinct OIDC subjects may share an email address."
+        )
     )
 
     class Meta:
@@ -146,6 +149,13 @@ class Tenant(models.Model):
     RGWSquared owns Ceph users, bucket lifecycle, and S3 credential issuance.
     """
 
+    RGWSQUARED_SYNCED = "rgwsquared_synced"
+    AUTHENTIK_MANAGED = "authentik_managed"
+    ACCESS_MODEL_CHOICES = [
+        (RGWSQUARED_SYNCED, "RGWSquared-synced"),
+        (AUTHENTIK_MANAGED, "Authentik-managed"),
+    ]
+
     code = models.CharField(max_length=30, unique=True)
     name = models.CharField(max_length=200)
     rgwsquared_structure = models.CharField(
@@ -157,6 +167,15 @@ class Tenant(models.Model):
         max_length=50,
         blank=True,
         help_text="Prefix for local research bucket names (e.g., 'nffa-di')",
+    )
+    access_model = models.CharField(
+        max_length=24,
+        choices=ACCESS_MODEL_CHOICES,
+        default=AUTHENTIK_MANAGED,
+        help_text=(
+            "RGWSquared-synced tenants import users and roles from RGWSquared; "
+            "Authentik-managed tenants register users and roles at OIDC login."
+        ),
     )
     is_active = models.BooleanField(default=True)
 
@@ -193,6 +212,20 @@ class TenantMembership(models.Model):
         help_text="Operational unit code for NFFADI bucket naming (e.g., 'cnr-iom.ts')",
     )
     is_active = models.BooleanField(default=True)
+    access_revoked_at = models.DateTimeField(null=True, blank=True)
+    access_revocation_reason = models.CharField(
+        max_length=32,
+        blank=True,
+        choices=[
+            ("mapping_removed", "Authentik group mapping removed"),
+            ("claim_missing", "Mapped Authentik group missing at login"),
+        ],
+    )
+    access_revoked_group = models.CharField(
+        max_length=200,
+        blank=True,
+        help_text="Mapped Authentik group whose loss caused the revocation.",
+    )
 
     class Meta:
         db_table = "tenant_memberships"
@@ -313,6 +346,13 @@ class FileUploadRecord(models.Model):
     """Tracks who uploaded a file. Needed for shared buckets where
     shared RW users can only delete their own files."""
 
+    APP = "app"
+    DISCOVERED = "discovered"
+    ORIGIN_CHOICES = [
+        (APP, "Uploaded through Buckets Explorer"),
+        (DISCOVERED, "Discovered in object storage"),
+    ]
+
     bucket = models.ForeignKey(
         Bucket, on_delete=models.CASCADE, related_name="upload_records"
     )
@@ -320,6 +360,9 @@ class FileUploadRecord(models.Model):
     uploaded_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
     uploaded_at = models.DateTimeField(auto_now_add=True)
     file_size = models.BigIntegerField(default=0)
+    origin = models.CharField(max_length=12, choices=ORIGIN_CHOICES, default=APP)
+    object_etag = models.CharField(max_length=255, blank=True)
+    object_last_modified = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         db_table = "file_upload_records"

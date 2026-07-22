@@ -200,7 +200,7 @@
     <div class="row"><span class="type">bigint</span><span class="field">id</span><span class="key pk">PK</span></div>
     <div class="row"><span class="type">string</span><span class="field">username</span><span></span></div>
     <div class="row"><span class="type">string</span><span class="field">display_username</span><span class="key uk">UK</span></div>
-    <div class="row"><span class="type">string</span><span class="field">email</span><span class="key uk">UK</span></div>
+    <div class="row"><span class="type">string</span><span class="field">email</span><span></span></div>
     <div class="row"><span class="type">string</span><span class="field">external_id</span><span class="key uk">UK</span></div>
     <div class="row"><span class="type">string</span><span class="field">idp_source</span><span></span></div>
     <div class="row"><span class="type">string</span><span class="field">institution</span><span></span></div>
@@ -222,6 +222,9 @@
     <div class="row"><span class="type">string</span><span class="field">role</span><span></span></div>
     <div class="row"><span class="type">string</span><span class="field">uo_code</span><span></span></div>
     <div class="row"><span class="type">boolean</span><span class="field">is_active</span><span></span></div>
+    <div class="row"><span class="type">datetime</span><span class="field">access_revoked_at</span><span></span></div>
+    <div class="row"><span class="type">string</span><span class="field">access_revocation_reason</span><span></span></div>
+    <div class="row"><span class="type">string</span><span class="field">access_revoked_group</span><span></span></div>
     <div class="row"><span class="type">unique</span><span class="field">user_id + tenant_id</span><span class="key uk">UK</span></div>
     <div class="row"><span class="type">unique</span><span class="field">active tenant + ceph_username</span><span class="key uk">UK</span></div>
   </section>
@@ -233,6 +236,7 @@
     <div class="row"><span class="type">string</span><span class="field">name</span><span></span></div>
     <div class="row"><span class="type">string</span><span class="field">rgwsquared_structure</span><span></span></div>
     <div class="row"><span class="type">string</span><span class="field">bucket_name_prefix</span><span></span></div>
+    <div class="row"><span class="type">string</span><span class="field">access_model</span><span></span></div>
     <div class="row"><span class="type">boolean</span><span class="field">is_active</span><span></span></div>
   </section>
 
@@ -270,6 +274,9 @@
     <div class="row"><span class="type">bigint</span><span class="field">uploaded_by_id</span><span class="key fk">FK</span></div>
     <div class="row"><span class="type">bigint</span><span class="field">file_size</span><span></span></div>
     <div class="row"><span class="type">datetime</span><span class="field">uploaded_at</span><span></span></div>
+    <div class="row"><span class="type">string</span><span class="field">origin</span><span></span></div>
+    <div class="row"><span class="type">string</span><span class="field">object_etag</span><span></span></div>
+    <div class="row"><span class="type">datetime</span><span class="field">object_last_modified</span><span></span></div>
     <div class="row"><span class="type">unique</span><span class="field">bucket_id + file_key</span><span class="key uk">UK</span></div>
   </section>
 

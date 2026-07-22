@@ -50,7 +50,7 @@ function TenantDocPage() {
   return (
     <div className="page-container">
       <Navbar user={user} />
-      <div className="dashboard-container" style={{ maxWidth: '860px' }}>
+      <div className="dashboard-container" style={{ maxWidth: '1024px' }}>
         {notFound || !content ? (
           <div style={{ color: '#64748b', padding: '2rem 0' }}>
             No documentation is available for this tenant.

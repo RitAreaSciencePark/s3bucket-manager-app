@@ -10,34 +10,16 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from storage.models import TenantMembership, UOMapping, TenantDocument, GroupTenantMapping
+from storage.models import TenantMembership, UOMapping, TenantDocument
 from storage.serializers import UserSerializer
-from storage.access import NFFADI_AUTHENTIK_GROUP, is_nffadi_tenant
+from storage.access import configured_tenant_ids
 
 logger = logging.getLogger(__name__)
 
 
 def _tenants_with_groups():
     """Return tenant IDs whose Authentik mapping is login-ready."""
-    ready = set()
-    mappings_by_tenant = {}
-    for mapping in GroupTenantMapping.objects.select_related("tenant").filter(
-        tenant__is_active=True
-    ):
-        mappings_by_tenant.setdefault(mapping.tenant_id, []).append(mapping)
-
-    for tenant_id, mappings in mappings_by_tenant.items():
-        tenant = mappings[0].tenant
-        if is_nffadi_tenant(tenant):
-            if (
-                len(mappings) == 1
-                and mappings[0].role == "rw"
-                and mappings[0].authentik_group == NFFADI_AUTHENTIK_GROUP
-            ):
-                ready.add(tenant_id)
-        else:
-            ready.add(tenant_id)
-    return ready
+    return configured_tenant_ids()
 
 
 def _tenant_doc_info(tenant):
@@ -88,7 +70,7 @@ def exchange_token(request):
             status=status.HTTP_403_FORBIDDEN,
         )
     memberships = TenantMembership.objects.filter(
-        user=user, is_active=True
+        user=user, is_active=True, access_revoked_at__isnull=True
     ).select_related("tenant", "tenant__document")
 
     # Only expose tenants that have at least one Authentik group registered in GroupTenantMapping.
@@ -188,6 +170,7 @@ def select_tenant(request):
             user=request.user,
             tenant_id=tenant_id,
             is_active=True,
+            access_revoked_at__isnull=True,
         )
     except TenantMembership.DoesNotExist:
         return Response(
@@ -235,7 +218,7 @@ def current_user(request):
     """Get current user info with tenant memberships."""
     user = request.user
     memberships = TenantMembership.objects.filter(
-        user=user, is_active=True
+        user=user, is_active=True, access_revoked_at__isnull=True
     ).select_related("tenant", "tenant__document")
 
     user_data = UserSerializer(user).data
@@ -285,7 +268,12 @@ def tenant_document(request):
     try:
         membership = TenantMembership.objects.select_related(
             "tenant", "tenant__document"
-        ).get(user=request.user, tenant_id=tenant_id, is_active=True)
+        ).get(
+            user=request.user,
+            tenant_id=tenant_id,
+            is_active=True,
+            access_revoked_at__isnull=True,
+        )
     except TenantMembership.DoesNotExist:
         return Response({"error": "Tenant not found"}, status=status.HTTP_404_NOT_FOUND)
 

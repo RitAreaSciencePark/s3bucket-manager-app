@@ -81,7 +81,7 @@ The app uses several usernames because each system has a different job.
 | Field | Source | Purpose |
 | --- | --- | --- |
 | `User.external_id` | Authentik OIDC `sub` | Stable federation identity. |
-| `User.email` | Authentik OIDC `email` | Human contact identity and first source for display naming. |
+| `User.email` | Authentik OIDC `email` | Contact attribute and first source for display naming; not an identity key. |
 | `User.display_username` | Derived from email local part | Stable user-facing name used in the UI, sharing, and local bucket naming. |
 | Authentik `preferred_username` | Authentik | Ceph-facing username candidate. |
 | `TenantMembership.ceph_username` | Authentik/RGWSquared | Username sent to RGWSquared and represented in Ceph subuser IDs. |
@@ -90,97 +90,81 @@ The display username is deliberately separate from the Ceph username. A user
 should see a readable name, while the backend still needs the exact RGWSquared
 username for policy calls.
 
+OIDC `sub` defines an account. Two Authentik accounts with the same email create
+two Django users because their groups, staff status, and Ceph usernames can
+differ. `display_username` resolves the human-readable collision by adding a
+numeric suffix. Never merge accounts by email.
+
 Login is tenant-gated. A user can authenticate successfully at Authentik and
 still be denied by Buckets Explorer if no activated tenant is eligible. The app
 accepts partial multi-tenant login: if a user belongs to several tenants and one
 tenant is not ready, login still succeeds for the tenants that are ready.
 
-Tenant eligibility starts with two local checks: the Django tenant exists and is
-active, and the user has a matching Authentik group mapping for that tenant.
-After that, tenant-specific storage rules decide how much RGWSquared evidence is
-required.
+Tenant access has two explicit models selected when the tenant is activated:
 
-For NFFADI, Authentik only proves that the user belongs to the tenant. The only
-allowed group is `nffa-di-users`. RGWSquared must also list the user in the
-structure, and RO/RW role truth comes from RGWSquared user bucket permissions.
+- `rgwsquared_synced`: refresh imports upstream users and RO/RW roles.
+  Authentik supplies one eligibility group that gates login.
+- `authentik_managed`: users register only after a login containing a mapped
+  Authentik group; mapped RW takes precedence over mapped RO.
 
-For other tenants, Authentik group mappings carry the initial role. The normal
-pattern is:
+Users may carry any number of Authentik groups. Only groups present in
+`GroupTenantMapping` affect tenant access; unrelated groups are ignored.
+Membership activity records upstream storage presence. Revocation is separate:
+`access_revoked_at` is null for usable access and timestamped only when a
+mapping is removed or a later login no longer contains the group.
 
-- `{tenant}-users` for read-write users,
-- `{tenant}-ext` for read-only users.
+Deleting a mapping never deletes the user, membership, permissions, uploads, or
+audit data. If a user last presented both RW and RO groups, deleting the RW
+mapping immediately falls back to RO. Otherwise access is revoked. Recreating a
+mapping does not silently restore revoked access; a successful later login
+re-evaluates current claims and clears revocation. Every bucket and file
+operation checks active membership, valid tenant mapping, and revocation state,
+so an old JWT cannot retain access.
 
-RGWSquared may still refine bucket visibility when data is available.
+NFFADI uses `rgwsquared_synced` with the fixed eligibility group
+`nffa-di-users`. RGWSquared user and bucket state determines RO/RW. Simple
+tenants use `authentik_managed`, normally with `{tenant}-users` for RW and
+`{tenant}-ext` for RO.
 
-### RGWSquared user provisioning by tenant type
+### User provisioning by access model
 
-How a user gains a Ceph account depends on which model the tenant uses.
+**`rgwsquared_synced`:** The institution or research programme pre-provisions
+users. Admin refresh imports the upstream roster, memberships, roles, proposal
+buckets, and permissions. The login pipeline requires the configured eligibility
+group and rejects a username absent from RGWSquared. The webapp never calls
+`userCreate` for these tenants.
 
-**NFFADI (and future proposal-based tenants):** Users are pre-provisioned by the
-institution or research programme — RGWSquared maintains the authoritative user list. The
-login pipeline checks `userList` and rejects login if the user is absent (`required=True`).
-Role and bucket access come from RGWSquared `userInfo`. The webapp never creates users in
-RGWSquared for these tenants.
-
-**Simple non-NFFADI tenants (GENOME, PHOTON, etc.):** Users arrive through Authentik. The
-`GroupTenantMapping` is the access authority (role = `rw` or `ro`). At login, if the user
-is not yet present in RGWSquared, the pipeline auto-creates the Ceph account via
-`userCreate` (`_sync_rgwsquared_user_access` in `pipeline.py`, `required=False` path). The
-user starts with no project buckets; they create local buckets from the UI.
-
-**Code path for `userCreate` (non-NFFADI first login):**
+**`authentik_managed`:** A successful login with a mapped group creates the
+Django membership. If the user is absent from RGWSquared, the pipeline calls
+`userCreate`; the highest mapped role wins. Admin refresh processes only
+already-registered OIDC users and reports unknown upstream identities as
+`users_skipped_unregistered` instead of creating placeholders.
 
 ```mermaid
 flowchart TD
     Login[User completes Authentik OAuth]
-    Pipeline["extract_tenant_info() in pipeline.py"]
-    Sync["_sync_rgwsquared_user_access(required=False)"]
-    List["RGWSquaredClient.list_users(structure)"]
-    Create["RGWSquaredClient.create_user() → POST /s3struct/userCreate"]
-    Done[Login succeeds; role from GroupTenantMapping]
+    Model{Tenant access model}
+    Required[Require upstream RGWSquared user and use upstream role]
+    Managed[Require mapped Authentik group and use highest mapped role]
+    Create[Create missing RGWSquared user]
+    Done[Issue tenant access]
 
-    Login --> Pipeline --> Sync --> List
-    List -->|user absent| Create --> Done
-    List -->|user present| Done
+    Login --> Model
+    Model -->|rgwsquared_synced| Required --> Done
+    Model -->|authentik_managed| Managed --> Create --> Done
 ```
 
 Implementation references:
 
-- `storage/pipeline.py` — `_sync_rgwsquared_user_access()` calls `create_user` when `ceph_username not in users` and `required=False`.
-- `storage/services/rgw_squared.py` — `create_user()` posts `{"structure", "user"}` to `/s3struct/userCreate`.
-- `docs/rgwsquared-api.md` — API shape for `userCreate`.
+- `storage/pipeline.py` validates the eligibility chain and reconciles revocation.
+- `storage/services/sync_service.py` imports upstream rosters only for
+  `rgwsquared_synced` tenants.
+- `storage/services/rgw_squared.py` implements `userCreate` for
+  `authentik_managed` first login.
 
-NFFADI (`required=True`) **never** calls `userCreate`; missing users are rejected at login.
-
-**Admin responsibility:** The `GroupTenantMapping` for every tenant a user belongs to must
-be configured **before** the user's first login attempt. If the mapping does not exist at
-login time, the pipeline raises `AuthForbidden` and the browser shows "Your Authentik
-account is not a member of any registered group." This is a configuration gap, not a code
-bug — set up the mapping in the admin Tenants panel first.
-
-**Proposals and project buckets for non-NFFADI tenants — open design decision:**
-
-The current codebase syncs proposal/project bucket records from RGWSquared at login only for
-tenants where `_sync_rgwsquared_user_access` returns True and the user has bucket entries in
-`userInfo`. For simple non-NFFADI tenants whose users are auto-provisioned and start with no
-buckets, this sync produces no records — which is correct for the current use case (local
-buckets only).
-
-If a future non-NFFADI tenant needs to expose upstream proposal or project buckets (like
-NFFADI does), the maintainer must decide between two approaches:
-
-1. **Adopt the NFFADI model**: set `required=True` for the tenant, require users to be
-   pre-provisioned in RGWSquared by an upstream system, and let `_sync_user_buckets_on_login`
-   populate bucket records. Suitable when an external system manages the user roster.
-
-2. **Periodic sync model**: keep `required=False` (auto-provision at login) and add an
-   explicit admin refresh action that calls `userInfo` for each member and syncs bucket
-   access. Suitable when the bucket list changes independently of login events.
-
-Neither path is currently implemented for non-NFFADI tenants. Choosing the wrong model causes
-silent bugs: approach 1 without pre-provisioning locks out all users; approach 2 without the
-refresh action leaves bucket records perpetually stale. Document the chosen model in this
-guide when it is implemented.
+Configure the access model and group mapping before first login. Missing
+configuration raises `AuthForbidden`; it must never be treated as implicit
+authorization.
 
 ## Tenant Activation
 
@@ -295,6 +279,13 @@ Every upload creates or updates a `FileUploadRecord`. That record lets the app
 show who uploaded a file and enforce the shared-bucket deletion rule: bucket
 owners can delete any file; shared RW users can delete only files they uploaded.
 
+Tenant Refresh also inventories Ceph objects in buckets that already have a
+trusted `BucketPermission`. Objects created outside the app are stored with
+`origin=discovered` and `uploaded_by=null`; the app never guesses provenance.
+The object's ETag and last-modified timestamp detect replacement under an
+existing key. A changed object loses stale app-uploader attribution. Records are
+removed only after a successful S3 listing proves the object is absent.
+
 ## Database Model
 
 The database is not a copy of Ceph. It is the state needed to make the UI,
@@ -329,7 +320,7 @@ Django auth columns inherited by the custom user model are omitted for clarity.
 | `id` | Primary key. |
 | `username` | Django username, usually derived from the federated identity. |
 | `display_username` | Unique stable display name used in UI, sharing, and local bucket naming. |
-| `email` | Unique email from the identity provider. |
+| `email` | Contact email from the identity provider; multiple OIDC subjects may share it. |
 | `external_id` | Unique OIDC `sub` identifier. |
 | `idp_source` | Identity provider label, normally `authentik`. |
 | `institution` | Institution claim from the identity provider. |
@@ -341,8 +332,8 @@ Django auth columns inherited by the custom user model are omitted for clarity.
 | `is_approved` | Application-level account gate. |
 | `notes` | Admin-only notes about the account. |
 
-Key constraints and indexes: unique `display_username`, `email`, and
-`external_id`; indexes on identity and institution fields.
+Key constraints and indexes: unique `display_username` and `external_id`;
+indexes on email, identity, and institution fields.
 
 #### `tenants`
 
@@ -353,6 +344,7 @@ Key constraints and indexes: unique `display_username`, `email`, and
 | `name` | Human-readable tenant name. |
 | `rgwsquared_structure` | Structure name used for RGWSquared calls. |
 | `bucket_name_prefix` | Local naming prefix used by activation/admin workflows. |
+| `access_model` | `rgwsquared_synced` or `authentik_managed`; defines user and role authority. |
 | `is_active` | Whether the tenant can be used by the app. |
 
 Key constraints: unique `code`.
@@ -367,7 +359,10 @@ Key constraints: unique `code`.
 | `ceph_username` | RGWSquared/Ceph username for this user in this tenant. |
 | `role` | Tenant role: `ro`, `rw`, or `admin`. |
 | `uo_code` | Operational-unit code for write-capable memberships when required. |
-| `is_active` | Whether this membership can currently be used. |
+| `is_active` | Whether RGWSquared or the application still considers the membership present. |
+| `access_revoked_at` | Explicit revocation timestamp; null means not revoked. |
+| `access_revocation_reason` | `mapping_removed` or `claim_missing`. |
+| `access_revoked_group` | Group whose removal or absence caused revocation. |
 
 Key constraints and indexes: unique `(user_id, tenant_id)`; unique active
 `(tenant_id, ceph_username)`; index on `(tenant_id, ceph_username)`.
@@ -411,9 +406,12 @@ Key constraints: unique `(bucket_id, user_id)`.
 | `id` | Primary key. |
 | `bucket_id` | Foreign key to `buckets`. |
 | `file_key` | Final object key written to Ceph. |
-| `uploaded_by_id` | Foreign key to `users`; null if the user record is removed. |
+| `uploaded_by_id` | Foreign key to `users`; null for externally discovered objects or removed users. |
 | `file_size` | Object size in bytes. |
 | `uploaded_at` | Upload timestamp. |
+| `origin` | `app` for app uploads or `discovered` for objects found during Refresh. |
+| `object_etag` | S3 ETag used to detect replacement under the same key. |
+| `object_last_modified` | Last-modified timestamp reported by Ceph RGW. |
 
 Key constraints: unique `(bucket_id, file_key)`.
 
@@ -468,7 +466,7 @@ To export the visual schema as a PDF from the repository root:
 
 ```bash
 google-chrome --headless --disable-gpu --no-sandbox \
-  --print-to-pdf=bucket-explorer-database-schema.pdf --print-to-pdf-no-header \
+  --print-to-pdf="$PWD/docs/database-schema.pdf" --print-to-pdf-no-header \
   "file://$PWD/docs/database-schema.html"
 ```
 

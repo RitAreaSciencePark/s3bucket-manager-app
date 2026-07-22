@@ -347,12 +347,14 @@ The controller listens on a NodePort. `app.sh access` detects it automatically a
 
 ## Step 7: Set Up Container Registry Credentials (GHCR)
 
-The application images are published to **GitHub Container Registry** (GHCR) as public packages. K3s pulls them without authentication. Only pushing requires credentials.
+The application images are published to **GitHub Container Registry** (GHCR).
+`app.sh` uses the local token both to push images and to create the namespace-scoped
+pull secret required when those packages are private.
 
 ### 7.1 Create a GitHub Personal Access Token
 
 1. Go to GitHub → Settings → Developer Settings → Personal Access Tokens → Tokens (classic)
-2. Create a new token with `write:packages` scope
+2. Create a new token with `read:packages` and `write:packages` scopes
 3. Copy the token (`ghp_...`)
 
 ### 7.2 Create the k8s/.env File
@@ -372,14 +374,16 @@ This file is gitignored. `app.sh` sources it automatically for `podman push` and
 
 ## Step 8: K8s API Access Tunnel
 
+This step produces **`/tmp/k3s-tunnel-kubeconfig.yaml`** — the patched kubeconfig file used by all deploy scripts and documented in [Development deployment operations](dev-deployment-operations.md#how-the-kubeconfig-file-is-created). You do not create it manually in normal use.
+
 K3s exposes its API on port 6443, which is firewalled on the VMs — a direct `kubectl` from the deployment host will fail. Access requires an SSH tunnel that forwards a local port to the K3s API on the VM.
 
-**In normal use, run `./app.sh access` at the start of each session.** It sets up the SSH tunnel, fetches and patches the kubeconfig, and starts port-forwards for the frontend and Authentik — all in one command.
+**In normal use, run `./app.sh access` at the start of each session.** It sets up the SSH tunnel, fetches and patches the kubeconfig (if the file is missing), and starts port-forwards for the frontend and Authentik — all in one command.
 
 ```bash
+cd k8s
+./app.sh access          # creates /tmp/k3s-tunnel-kubeconfig.yaml if missing
 export KUBECONFIG=/tmp/k3s-tunnel-kubeconfig.yaml
-cd /root/s3bucket_manager_app/k8s
-./app.sh access
 kubectl cluster-info   # should print API at 127.0.0.1:16443
 ```
 
@@ -430,10 +434,10 @@ cp env/dev/backend-config.yaml env/dev/backend-config.local.yaml
 #   OIDC_CLIENT_ID, OIDC_APPLICATION_SLUG: leave as-is; configure_authentik.py sets these
 
 # Deploy Authentik (identity layer) — uses infra-secrets.local.yaml
-./infra.sh deploy --env dev
+./infra.sh deploy
 
 # Build and deploy the application — uses app-secrets.local.yaml + backend-config.local.yaml
-./app.sh deploy --env dev --rebuild
+./app.sh deploy --rebuild
 ```
 
 The scripts wait for pods to become healthy before continuing. After a successful deploy:
@@ -452,6 +456,8 @@ ssh -L 3000:localhost:3000 -L 9000:localhost:9000 orfeo-vm
 ```
 
 Then open `http://localhost:3000`. `./app.sh access` on the deployment host prints this command when setup completes.
+
+> **Ongoing operations:** For day-to-day deploy, code updates, kubeconfig, and command reference, see [Development deployment operations](dev-deployment-operations.md).
 
 ---
 
@@ -502,10 +508,10 @@ virsh list --all | grep -E "kube|ceph|ipa"
 ssh root@198.51.100.90 "ceph -s"
 kubectl get nodes
 
-# 3. Establish access tunnel + port-forwards
-export KUBECONFIG=/tmp/k3s-tunnel-kubeconfig.yaml
-cd /root/s3bucket_manager_app/k8s
+# 3. Establish access tunnel + port-forwards (creates kubeconfig if missing)
+cd k8s
 ./app.sh access
+export KUBECONFIG=/tmp/k3s-tunnel-kubeconfig.yaml
 
 # 4. Open http://localhost:3000
 ```
@@ -523,4 +529,4 @@ cd /root/s3bucket_manager_app/k8s
 | SSH `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED` | VM was reprovisioned | `ssh-keygen -R 198.51.100.XX` |
 | K3s etcd split-brain | All nodes had `cluster-init: true` | Follow the manual recovery procedure in Step 5 |
 | `haproxy-4` IngressClass missing | HAProxy controller not installed or wrong release | Re-run Step 6 |
-| Image pull failure on K3s pods | GHCR or network issue | Images are public; check internet connectivity from K3s node |
+| Image pull failure on K3s pods | Missing/expired GHCR credentials, wrong repository, missing digest, or network issue | Re-run `./app.sh deploy` to refresh `ghcr-pull-secret`; inspect pod Events |

@@ -52,21 +52,17 @@ spec:
           volumeMounts:
             - name: postgres-data
               mountPath: /var/lib/postgresql/data
-          # PostgreSQL: IO-bound, NOT CPU-bound. Memory is the key resource (shared_buffers cache,
-          # connection overhead ~5-10 MB per connection).
+          # PostgreSQL stores Django metadata only (not object data). IO-bound, not CPU-bound.
           # With gunicorn 2 workers + admin panel, expect ~10-15 concurrent DB connections.
-          #
-          # DEV:  requests=250m/512Mi, limits=1000m/1Gi
-          # PROD: requests=500m/2Gi,   limits=2000m/8Gi  → quota: ~2/8 CPU, ~8/32Gi memory.
-          #       Tune shared_buffers to ~25% of memory limit (2Gi for 8Gi limit):
-          #       add env POSTGRES_INITDB_ARGS: "--shared-buffers=2GB" or mount a postgresql.conf.
+          # Prod steady-state observed ~3m CPU / ~27Mi RAM; 512Mi limit leaves ample headroom
+          # for metadata growth while freeing namespace quota (limits.cpu / limits.memory).
           resources:
             requests:
-              memory: "512Mi"
-              cpu: "250m"
+              memory: "256Mi"
+              cpu: "100m"
             limits:
-              memory: "1Gi"
-              cpu: "1000m"
+              memory: "512Mi"
+              cpu: "500m"
           readinessProbe:
             exec:
               command:

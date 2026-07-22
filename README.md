@@ -4,7 +4,7 @@ A web application for managing S3 buckets on **Ceph RADOS Gateway (RGW)**, deplo
 
 **Live deployment:** [https://buckets-explorer.areasciencepark.it/](https://buckets-explorer.areasciencepark.it/)
 
-**DOI:** [10.5281/zenodo.20623985](https://doi.org/10.5281/zenodo.20623985)
+**DOI:** [10.5281/zenodo.20649690](https://doi.org/10.5281/zenodo.20649690)
 
 ## Architecture
 
@@ -145,38 +145,43 @@ cd k8s
 ### Deploy
 
 ```bash
-# 1. Set the kubeconfig (needed for all kubectl commands)
+cd k8s
+# 1. Cluster access — creates /tmp/k3s-tunnel-kubeconfig.yaml if missing
+./app.sh access
 export KUBECONFIG=/tmp/k3s-tunnel-kubeconfig.yaml
 
-# 2. Run the deployment from the repository checkout
-cd k8s
+# 2. Deploy infrastructure then application
 ./infra.sh deploy
 ./app.sh deploy --rebuild
 ```
+
+See [Development deployment operations](docs/dev-deployment-operations.md#how-the-kubeconfig-file-is-created) for how the kubeconfig file is created.
 
 > **Trouble?** Run `./infra.sh check` to diagnose infrastructure prerequisites such as node reachability, Kubernetes API access, registry access, and Ceph RGW health.
 
 ### Access the App
 
-**Step 1 — Port-forward from the deployment host** (two terminals):
+**Recommended — one command on the deployment host:**
 
 ```bash
+cd k8s
+./app.sh access          # tunnel + kubeconfig + port-forwards on :3000 and :9000
 export KUBECONFIG=/tmp/k3s-tunnel-kubeconfig.yaml
-
-# Terminal 1: React frontend
-kubectl port-forward -n bucket-explorer svc/frontend-service 3000:80
-
-# Terminal 2: Authentik (for OAuth2 login)
-kubectl port-forward -n authentik-bucket-explorer svc/authentik-service 9000:9000
 ```
 
-**Step 2 — From your laptop, tunnel to the deployment host** (development host alias: `orfeo-vm`):
+**From your laptop**, tunnel to the deployment host (replace `orfeo-vm` with your SSH alias):
 
 ```bash
 ssh -L 3000:localhost:3000 -L 9000:localhost:9000 orfeo-vm
 ```
 
-Or run `./app.sh access` on the deployment host—it prints the same SSH command and starts port-forwards automatically.
+**Manual port-forwards** (only if you are not using `./app.sh access`):
+
+```bash
+export KUBECONFIG=/tmp/k3s-tunnel-kubeconfig.yaml
+kubectl port-forward -n bucket-explorer svc/frontend-service 3000:80
+kubectl port-forward -n authentik-bucket-explorer svc/authentik-service 9000:9000
+```
 
 **Step 3 — Open browser:**
 
@@ -190,8 +195,9 @@ Or run `./app.sh access` on the deployment host—it prints the same SSH command
 ### Cleanup
 
 ```bash
-export KUBECONFIG=/tmp/k3s-tunnel-kubeconfig.yaml
 cd k8s
+./app.sh access
+export KUBECONFIG=/tmp/k3s-tunnel-kubeconfig.yaml
 ./app.sh cleanup
 ./infra.sh cleanup
 ```
@@ -228,6 +234,7 @@ cd k8s
 ./app.sh all
 
 # Changed a K8s manifest (YAML)? Apply it directly:
+./app.sh access
 export KUBECONFIG=/tmp/k3s-tunnel-kubeconfig.yaml
 kubectl apply -f manifests/app/02-backend.yaml
 ./app.sh restart backend
@@ -238,11 +245,12 @@ kubectl apply -f manifests/app/02-backend.yaml
 ```bash
 cd k8s
 
+# Re-establish tunnel, kubeconfig, and port-forwards (creates file if missing)
+./app.sh access
+export KUBECONFIG=/tmp/k3s-tunnel-kubeconfig.yaml
+
 # Quick health check — is everything alive?
 ./app.sh status
-
-# If SSH tunnel or port-forwards are down:
-./app.sh access
 
 # If deeper issues (Ceph, VMs, disk space):
 ./infra.sh check

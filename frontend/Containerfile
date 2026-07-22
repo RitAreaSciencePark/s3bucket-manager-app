@@ -28,9 +28,9 @@
 FROM node:20-alpine AS builder
 WORKDIR /app
 # Copy dependency files first (Docker caching optimization):
-# If only source code changes, npm install layer is cached from last build.
+# If only source code changes, npm dependency layer is cached from last build.
 COPY package.json package-lock.json* ./
-RUN npm install
+RUN npm ci
 # Now copy source code and build
 COPY . .
 RUN npm run build

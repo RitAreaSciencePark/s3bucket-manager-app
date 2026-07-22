@@ -7,6 +7,7 @@ import zipfile
 
 from django.http import HttpResponse
 from django.db import transaction
+from django.utils import timezone
 from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiResponse
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
@@ -14,6 +15,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from botocore.exceptions import ClientError
 
+from storage.access import membership_has_access
 from storage.models import (
     Bucket,
     BucketPermission,
@@ -55,13 +57,15 @@ def _get_membership(request):
     if not tenant_id:
         return None
     try:
-        return TenantMembership.objects.select_related("tenant").get(
+        membership = TenantMembership.objects.select_related("user", "tenant").get(
             user=request.user,
             tenant_id=tenant_id,
             is_active=True,
+            access_revoked_at__isnull=True,
         )
     except TenantMembership.DoesNotExist:
         return None
+    return membership if membership_has_access(membership) else None
 
 
 def _get_rgw_client():
@@ -131,7 +135,10 @@ def _apply_filename_policy(bucket, requesting_user, original_key):
         # Always use the uploader's UO code for NFFADI (proposal and local).
         # Dots in uo_code (e.g. cnr-iom.ts) translate to dashes for valid filenames.
         m = TenantMembership.objects.filter(
-            user=requesting_user, tenant=bucket.tenant, is_active=True
+            user=requesting_user,
+            tenant=bucket.tenant,
+            is_active=True,
+            access_revoked_at__isnull=True,
         ).first()
         raw_uo = (m.uo_code or "").strip() if m else ""
         uo = raw_uo.replace(".", "-")  # cnr-iom.ts → cnr-iom-ts
@@ -189,6 +196,7 @@ def _sync_local_bucket_permissions(bucket, desired_permissions):
                 tenant=bucket.tenant,
                 user_id=user_id,
                 is_active=True,
+                access_revoked_at__isnull=True,
             )
             .select_related("user")
             .first()
@@ -559,7 +567,7 @@ class BucketViewSet(viewsets.ViewSet):
 
         try:
             s3 = get_mgmt_s3_client(bucket.tenant)
-            upload_object(
+            upload_result = upload_object(
                 s3, bucket.name, file_key, file_bytes, content_type=content_type
             )
         except Exception as e:
@@ -572,7 +580,13 @@ class BucketViewSet(viewsets.ViewSet):
         FileUploadRecord.objects.update_or_create(
             bucket=bucket,
             file_key=file_key,
-            defaults={"uploaded_by": request.user, "file_size": len(file_bytes)},
+            defaults={
+                "uploaded_by": request.user,
+                "file_size": len(file_bytes),
+                "origin": FileUploadRecord.APP,
+                "object_etag": str(upload_result.get("ETag", "")).strip('"'),
+                "object_last_modified": timezone.now(),
+            },
         )
 
         return Response(
@@ -689,6 +703,7 @@ class BucketViewSet(viewsets.ViewSet):
                 for m in TenantMembership.objects.filter(
                     tenant_id=bucket.tenant_id,
                     is_active=True,
+                    access_revoked_at__isnull=True,
                 ).values("user_id", "ceph_username")
             }
 
@@ -754,6 +769,7 @@ class BucketViewSet(viewsets.ViewSet):
                 for m in TenantMembership.objects.filter(
                     tenant_id=bucket.tenant_id,
                     is_active=True,
+                    access_revoked_at__isnull=True,
                 ).values("user_id", "ceph_username")
             }
 
@@ -809,7 +825,28 @@ class BucketViewSet(viewsets.ViewSet):
             # 4. RGWSquared ceph_username (for instrument-scientist accounts)
             target_user = None
             if "@" in identifier:
-                target_user = User.objects.filter(email=identifier).first()
+                email_matches = list(
+                    User.objects.filter(
+                        email__iexact=identifier,
+                        memberships__tenant=bucket.tenant,
+                        memberships__is_active=True,
+                        memberships__access_revoked_at__isnull=True,
+                    )
+                    .distinct()
+                    .order_by("id")[:2]
+                )
+                if len(email_matches) > 1:
+                    return Response(
+                        {
+                            "error": (
+                                f'More than one tenant account uses "{identifier}". '
+                                "Use the account's unique display username or Ceph username."
+                            )
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+                if email_matches:
+                    target_user = email_matches[0]
             if not target_user:
                 # display_username is the email local-part (e.g. "name.surname" from
                 # "name.surname@example.com"), unique per user, collision-safe.
@@ -822,6 +859,7 @@ class BucketViewSet(viewsets.ViewSet):
                         ceph_username=identifier,
                         tenant=bucket.tenant,
                         is_active=True,
+                        access_revoked_at__isnull=True,
                     )
                     .select_related("user")
                     .first()
@@ -841,7 +879,10 @@ class BucketViewSet(viewsets.ViewSet):
 
             # Sharing is tenant-local; cross-tenant grants would bypass isolation.
             target_membership = TenantMembership.objects.filter(
-                user=target_user, tenant=bucket.tenant, is_active=True
+                user=target_user,
+                tenant=bucket.tenant,
+                is_active=True,
+                access_revoked_at__isnull=True,
             ).first()
             if not target_membership:
                 return Response(

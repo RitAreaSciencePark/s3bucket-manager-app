@@ -12,6 +12,8 @@ From the repository root:
 ./k8s/app.sh verify
 ```
 
+For deploy, updates, and kubeconfig setup, see [Development deployment operations](dev-deployment-operations.md).
+
 This runs the same steps as the GitHub Actions `verify` job:
 
 1. `bash -n` on `k8s/app.sh` and `k8s/infra.sh`
@@ -42,11 +44,21 @@ Workflow: [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
 
 | Job | When | What |
 | --- | --- | --- |
-| `verify` | Every push/PR to `dev` and `main` | pytest + coverage.xml + frontend build + Codecov upload |
-| `deploy-dev` | Push to `dev` only (after `verify`) | Build and push images to GHCR |
-| `deploy-dev-k8s` | After `deploy-dev` | Roll out to dev K3s via self-hosted runner |
+| `verify` | Every push/PR to `main` | pytest + coverage.xml + frontend build + Codecov upload |
 
-Production deployment remains **manual** (`kubectl` ladder). See [production-deployment.md](production-deployment.md).
+CI answers **"Is this commit safe?"** — it does not build, push, or roll out images. Dev deployment is **manual** on the operator host via [`k8s/app.sh`](../k8s/app.sh). See [Development deployment operations](dev-deployment-operations.md). Production deployment is also manual. See [production-deployment.md](production-deployment.md).
+
+## GHCR and secrets (local vs GitHub)
+
+| Artifact | Uses `GHCR_TOKEN`? | What it does |
+| --- | --- | --- |
+| `k8s/app.sh` | **Yes** — sources `k8s/.env` | Logs in for build/push paths and refreshes the namespace `ghcr-pull-secret` before deployment |
+| `k8s/.env.example` | Documents only | Template for local `GHCR_TOKEN` (classic PAT, `read:packages` + `write:packages`) |
+| `k8s/manifests/app/*.yaml` | **No** — static `image:` URLs | Deployments use the pull secret attached to the namespace's default service account |
+| `k8s/ci.sh` | **No** — uses `GITHUB_PAT` | Optional ARC self-hosted runner install (`repo` scope) |
+| GitHub Actions | **No** `GHCR_TOKEN` | Verify job only; image push is not run in CI |
+
+**Takeaway:** keep `GHCR_TOKEN` in gitignored `k8s/.env` for local deployment and image publication. You do not need `GHCR_TOKEN` as a GitHub repository secret for the current workflow.
 
 ## Codecov setup (one-time)
 
@@ -58,17 +70,15 @@ After the first green CI run, open the Codecov dashboard for coverage history an
 
 Future maintainers should point Codecov at their own GitHub organisation or fork and update the workflow token accordingly.
 
-## Dev bash scripts vs GitHub Actions
+## Dev deploy workflow
 
-Both paths should pass the same `verify` checks before deploy:
+| Step | Command |
+| --- | --- |
+| Verify locally | `cd k8s && ./app.sh verify` |
+| Build, push images, roll out dev | `cd k8s && ./app.sh deploy --rebuild` |
+| Port-forward / access URL | `./app.sh access` |
 
-| Step | Local (`k8s/app.sh`) | GitHub Actions |
-| --- | --- | --- |
-| Tests + build | `./app.sh verify` | `verify` job |
-| Build + push images | `./app.sh deploy --rebuild` or `./app.sh backend` | `deploy-dev` job |
-| Roll out to cluster | `kubectl` via tunnel/kubeconfig | `deploy-dev-k8s` on self-hosted runner |
-
-The self-hosted runner (`bucket-explorer-runner`) is installed with `k8s/ci.sh` and has in-cluster `kubectl` access. It runs only the `deploy-dev-k8s` job after images are pushed to GHCR; the `verify` job uses GitHub-hosted `ubuntu-latest`.
+`GHCR_TOKEN` in `k8s/.env` is required for deploys and image-push paths. The self-hosted runner (`bucket-explorer-runner`) installed via `k8s/ci.sh` is **optional** and not used by the current CI workflow.
 
 ## Before production image push
 

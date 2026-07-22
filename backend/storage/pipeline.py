@@ -2,10 +2,12 @@
 
 import logging
 from django.db import IntegrityError
+from django.utils import timezone
 from social_core.exceptions import AuthForbidden
 
 from storage.access import (
     is_nffadi_tenant,
+    is_rgwsquared_synced,
     is_valid_nffadi_mapping,
     is_write_capable,
     structure_name,
@@ -129,6 +131,8 @@ def associate_by_ceph_username(backend, details, response, user=None, *args, **k
         TenantMembership.objects.filter(
             ceph_username=preferred_username,
             is_active=True,
+            tenant__access_model="rgwsquared_synced",
+            user__external_id__startswith="ms:",
         )
         .select_related("user")
         .first()
@@ -142,42 +146,6 @@ def associate_by_ceph_username(backend, details, response, user=None, *args, **k
         return {"user": membership.user, "is_new": False}
 
     return None
-
-
-def associate_by_email(backend, details, response, user=None, *args, **kwargs):
-    """Attach OAuth login to an existing email user before creating a duplicate."""
-    from django.contrib.auth import get_user_model
-
-    User = get_user_model()
-
-    if user:
-        logger.info(f"User already found by social auth: {user.username}")
-        return {"user": user}
-
-    email = details.get("email")
-    if not email:
-        logger.warning("No email in details, cannot associate by email")
-        return None
-
-    try:
-        existing_user = User.objects.get(email=email)
-        logger.info(
-            f"Found existing user by email: username={existing_user.username}, "
-            f"email={email}. Will associate social auth account with this user."
-        )
-        return {"user": existing_user}
-    except User.DoesNotExist:
-        logger.info(f"No existing user found with email={email}, will create new user")
-        return None
-    except User.MultipleObjectsReturned:
-        logger.error(
-            f"Multiple users found with email={email}. "
-            "This violates unique constraint. Database inconsistent!"
-        )
-        raise AuthForbidden(
-            backend,
-            f"Multiple users found with email {email}. Please contact administrator.",
-        )
 
 
 def generate_username_with_fallback(
@@ -252,8 +220,11 @@ def create_or_update_user(backend, details, response, user=None, *args, **kwargs
             user.first_name = parts[0]
             user.last_name = parts[1] if len(parts) > 1 else ""
 
-    # Federation keys are authoritative on every login.
-    user.external_id = external_id
+    # A secondary social association must not rewrite the account's primary
+    # OIDC subject. Sync-created placeholders are claimed by the first real
+    # Authentik account that logs in with their Ceph username.
+    if not user.external_id or user.external_id.startswith("ms:"):
+        user.external_id = external_id
     user.idp_source = idp_source
 
     if not user.institution and institution:
@@ -338,6 +309,7 @@ def extract_tenant_info(backend, details, response, user=None, *args, **kwargs):
         )
     )
     if not mappings:
+        _reconcile_access(user, set())
         if is_app_admin:
             logger.info(
                 "Admin-only OAuth login for %s (no tenant group mappings)",
@@ -364,11 +336,12 @@ def extract_tenant_info(backend, details, response, user=None, *args, **kwargs):
     mappings = list(_best.values())
 
     matched_tenants = []
+    matched_tenant_ids = set()
     for mapping in mappings:
         tenant = mapping.tenant
 
-        if is_nffadi_tenant(tenant):
-            if not is_valid_nffadi_mapping(mapping):
+        if is_rgwsquared_synced(tenant):
+            if is_nffadi_tenant(tenant) and not is_valid_nffadi_mapping(mapping):
                 logger.warning(
                     "Ignoring invalid NFFADI mapping group=%s role=%s for user=%s",
                     mapping.authentik_group,
@@ -378,17 +351,28 @@ def extract_tenant_info(backend, details, response, user=None, *args, **kwargs):
                 continue
             if _sync_rgwsquared_user_access(user, ceph_username, tenant, required=True):
                 matched_tenants.append(tenant.code)
+                matched_tenant_ids.add(tenant.id)
             continue
 
-        membership, created = TenantMembership.objects.get_or_create(
-            user=user,
-            tenant=tenant,
-            defaults={
-                "ceph_username": ceph_username,
-                "role": mapping.role,
-                "is_active": True,
-            },
-        )
+        try:
+            membership, created = TenantMembership.objects.get_or_create(
+                user=user,
+                tenant=tenant,
+                defaults={
+                    "ceph_username": ceph_username,
+                    "role": mapping.role,
+                    "is_active": True,
+                },
+            )
+        except IntegrityError:
+            logger.warning(
+                "Ignoring tenant %s for %s: Ceph username %s is already assigned "
+                "to another account",
+                tenant.code,
+                user.username,
+                ceph_username,
+            )
+            continue
         update_fields = []
         if membership.ceph_username != ceph_username:
             membership.ceph_username = ceph_username
@@ -410,8 +394,10 @@ def extract_tenant_info(backend, details, response, user=None, *args, **kwargs):
             )
 
         matched_tenants.append(tenant.code)
+        matched_tenant_ids.add(tenant.id)
         _sync_rgwsquared_user_access(user, ceph_username, tenant, required=False)
 
+    _reconcile_access(user, matched_tenant_ids)
     _sync_uo_codes_for_user(user)
 
     if not matched_tenants:
@@ -434,12 +420,43 @@ def extract_tenant_info(backend, details, response, user=None, *args, **kwargs):
     return None
 
 
+def _reconcile_access(user, authorized_tenant_ids):
+    """Clear revocation for matched tenants and revoke lost group access."""
+    from storage.models import TenantMembership
+
+    memberships = TenantMembership.objects.select_related("tenant").filter(user=user)
+    memberships.filter(tenant_id__in=authorized_tenant_ids).update(
+        access_revoked_at=None,
+        access_revocation_reason="",
+        access_revoked_group="",
+    )
+
+    for membership in memberships.exclude(tenant_id__in=authorized_tenant_ids):
+        if membership.access_revoked_at is not None:
+            continue
+        mapped_groups = list(
+            membership.tenant.group_mappings.values_list(
+                "authentik_group", flat=True
+            )
+        )
+        membership.access_revoked_at = timezone.now()
+        membership.access_revocation_reason = "claim_missing"
+        membership.access_revoked_group = ",".join(mapped_groups)
+        membership.save(
+            update_fields=[
+                "access_revoked_at",
+                "access_revocation_reason",
+                "access_revoked_group",
+            ]
+        )
+
+
 def _sync_rgwsquared_user_access(user, ceph_username, tenant, required=False):
     """Sync one user's RGWSquared role/buckets for a tenant.
 
     Returns True when RGWSquared confirms the user belongs to the structure.
     For optional tenants, failures only skip bucket refinement; the group mapping
-    remains the login authority. For NFFADI, callers pass required=True.
+    remains the login authority. RGWSquared-synced tenants pass required=True.
     """
     from django.conf import settings
     from storage.models import TenantMembership
@@ -511,8 +528,8 @@ def _sync_rgwsquared_user_access(user, ceph_username, tenant, required=False):
             bucket_items=bucket_items,
         )
 
-        # For NFFADI (required=True): role is authoritative from RGWSquared bucket assignments.
-        # For non-NFFADI (required=False): role is authoritative from GroupTenantMapping;
+        # For RGWSquared-synced tenants, role comes from upstream bucket assignments.
+        # For Authentik-managed tenants, role comes from GroupTenantMapping;
         # extract_tenant_info already set it correctly — do not override.
         uoc_defaults = {"ceph_username": ceph_username, "is_active": True}
         if required:
@@ -639,8 +656,10 @@ def _sync_user_buckets_on_login(
             existing.save(update_fields=["permission"])
 
 
-def persist_authentik_groups(backend, details, response, user=None, *args, **kwargs):
-    """Store OIDC group names on the social auth record for auditing and ops."""
+def persist_authentik_groups(
+    backend, details, response, user=None, social=None, *args, **kwargs
+):
+    """Store claims on the social association used by this login."""
     if not user:
         return None
 
@@ -650,14 +669,19 @@ def persist_authentik_groups(backend, details, response, user=None, *args, **kwa
     if isinstance(groups, str):
         groups = [groups]
 
-    try:
-        social = UserSocialAuth.objects.get(user=user, provider=backend.name)
-    except UserSocialAuth.DoesNotExist:
+    if social is None:
+        social = UserSocialAuth.objects.filter(
+            user=user,
+            provider=backend.name,
+            uid=response.get("sub"),
+        ).first()
+    if social is None:
         logger.warning("No UserSocialAuth row to persist groups for %s", user.username)
         return None
 
     extra = dict(social.extra_data or {})
     extra["groups"] = list(groups)
+    extra["preferred_username"] = response.get("preferred_username") or user.username
     social.extra_data = extra
     social.save(update_fields=["extra_data"])
     logger.info("Persisted Authentik groups for %s: %s", user.username, groups)

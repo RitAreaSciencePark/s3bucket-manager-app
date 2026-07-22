@@ -32,6 +32,11 @@ body {
   background: #f5f7fa;
 }
 
+:root {
+  --app-content-max: min(96vw, 1400px);
+  --app-detail-max: min(96vw, 1550px);
+}
+
 /* ============================================================================
    2. LAYOUT
    ============================================================================ */
@@ -64,7 +69,7 @@ body {
 }
 
 .navbar-container {
-  max-width: 1200px;
+  max-width: var(--app-content-max);
   margin: 0 auto;
   padding: 0 2rem;
   display: flex;
@@ -228,7 +233,7 @@ body {
    ============================================================================ */
 
 .dashboard-container {
-  max-width: 1200px;
+  max-width: var(--app-content-max);
   margin: 0 auto;
   padding: 1.5rem 2rem;
 }
@@ -296,7 +301,7 @@ body {
    ============================================================================ */
 
 .bucket-detail-container {
-  max-width: min(96vw, 1550px);
+  max-width: var(--app-detail-max);
   margin: 0 auto;
   padding: 1.5rem 1.25rem;
 }
@@ -362,13 +367,18 @@ body {
   position: absolute;
   right: 0;
   top: calc(100% + 0.2rem);
-  min-width: 7.5rem;
+  min-width: 8.25rem;
   background: #fff;
   border: 1px solid #e2e8f0;
   border-radius: 6px;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
-  z-index: 20;
-  overflow: hidden;
+  z-index: 30;
+  overflow: visible;
+}
+
+.file-actions-dropdown[data-placement="above"] {
+  top: auto;
+  bottom: calc(100% + 0.2rem);
 }
 
 .file-actions-item {
@@ -475,7 +485,12 @@ body {
 }
 
 .files-table-container--detail {
+  overflow: visible;
+}
+
+.files-table-scroll--detail {
   overflow-x: auto;
+  overflow-y: visible;
 }
 
 .files-table--detail {
@@ -497,15 +512,19 @@ body {
 }
 
 .files-table--detail .files-col-uploader {
-  max-width: 11rem;
+  max-width: 10rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .files-table--detail .files-col-actions {
-  width: 4.5rem;
+  width: 6.5rem;
+  min-width: 6.5rem;
+  padding-left: 0.5rem;
+  padding-right: 0.5rem;
   white-space: nowrap;
+  overflow: visible;
 }
 
 @media (max-width: 900px) {
@@ -1124,8 +1143,8 @@ body {
    ============================================================================ */
 
 .nexus-viewer-container {
-  width: min(98vw, 1500px);
-  max-width: 1500px;
+  width: var(--app-detail-max);
+  max-width: var(--app-detail-max);
   margin: 0 auto;
   padding: 0.85rem 1rem 1rem;
 }
@@ -1361,8 +1380,9 @@ body {
 
 /* Fenced code blocks */
 .md-body pre {
-  background: #0f172a;
-  color: #e2e8f0;
+  background: #f8fafc;
+  color: #0f172a;
+  border: 1px solid #e2e8f0;
   border-radius: 8px;
   padding: 1rem 1.25rem;
   overflow-x: auto;
@@ -1456,6 +1476,10 @@ body {
   justify-content: center;
   margin: 1.25rem 0;
   overflow-x: auto;
+  padding: 1rem;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
 }
 .md-mermaid svg { max-width: 100%; height: auto; }
 

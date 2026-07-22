@@ -42,7 +42,12 @@ PostgreSQL is empty after redeploy. Ceph and RGWSquared still hold prior buckets
 
 **What admin sync restores:**
 
-- Proposal buckets and user-level grants from `userInfo` sync as before.
+- `rgwsquared_synced` tenants restore upstream users, memberships, roles,
+  proposal buckets, and grants from `userInfo`.
+- `authentik_managed` tenants never create placeholder users during refresh;
+  unknown upstream identities are counted as `users_skipped_unregistered`.
+- Objects inside buckets with trusted permissions are inventoried from Ceph.
+  Objects not uploaded through the app have unknown uploader provenance.
 - Manual `bucketList` items reappear as Django `Bucket` rows for **admin inventory only** (`bucket_type=local`, flagged **ORPHAN** when not webapp-created).
 
 **What sync does not do (by design):**
@@ -50,6 +55,8 @@ PostgreSQL is empty after redeploy. Ceph and RGWSquared still hold prior buckets
 - Orphan buckets are **never** granted `BucketPermission` rows — users do not see them on the dashboard.
 - `display_name` for orphans stays the full RGW id (e.g. `massimo-cuscuna-bucket01`), not a short project id like `bucket01`. Only webapp bucket create sets the short name.
 - `source=local` shares and owner records created only in Django are gone until users recreate or re-share.
+- Object inventory does not grant bucket access. A `BucketPermission` must come
+  from trusted RGWSquared state or a surviving app-owned local bucket.
 - Object data in Ceph is never auto-deleted. Remove orphan buckets explicitly via Admin Panel delete (RGWSquared `bucketDelete`) or operator curl.
 
 ## Bucket delete semantics
@@ -70,10 +77,15 @@ An **orphan** is a manual RGW bucket that exists in RGWSquared/Ceph but was not 
 ## Operator checklist after Class C
 
 1. Redeploy app manifests (`app.sh deploy` or production equivalent).
-2. Sign in to Admin Panel and run **Sync → Refresh local cache** per tenant.
-3. Review buckets flagged **ORPHAN** — these exist in RGW but are invisible to users.
-4. Delete orphans that should not exist (Admin Panel **Delete** or RGWSquared `bucketDelete`).
-5. Tell affected researchers to recreate buckets through the webapp if they need access again.
+2. Restore each tenant's explicit access model and Authentik group mappings
+   before refresh.
+3. Sign in to Admin Panel and run **Tenants → Refresh** per tenant. Confirm the
+   returned user, bucket, permission, and object counters.
+4. Require RGWSquared-synced users to show authorized unless explicitly revoked,
+   and require Authentik-managed unknown users to remain skipped.
+5. Review buckets flagged **ORPHAN** — these exist in RGW but are invisible to users.
+6. Delete orphans that should not exist (Admin Panel **Delete** or RGWSquared `bucketDelete`).
+7. Tell affected researchers to recreate buckets through the webapp if they need access again.
 
 ## Related docs
 

@@ -11,6 +11,10 @@ metadata:
     component: routing
 spec:
   ingressClassName: haproxy-4
+  tls:
+    - hosts:
+        - buckets-explorer.areasciencepark.it
+      secretName: wildcard.areasciencepark.it-certs
   rules:
     - host: buckets-explorer.areasciencepark.it
       http:

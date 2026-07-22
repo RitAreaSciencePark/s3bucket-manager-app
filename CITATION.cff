@@ -2,9 +2,9 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 type: software
 title: Buckets Explorer
-version: 1.0.0
-date-released: "2026-06-10"
-doi: 10.5281/zenodo.20623985
+version: 1.0.1
+date-released: "2026-06-11"
+doi: 10.5281/zenodo.20649690
 license: EUPL-1.2
 repository-code: https://github.com/RitAreaSciencePark/s3bucket-manager-app
 abstract: >

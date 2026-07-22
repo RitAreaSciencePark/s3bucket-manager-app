@@ -43,9 +43,8 @@ router.register(r"buckets", BucketViewSet, basename="bucket")
 urlpatterns = [
     path("favicon.ico", lambda r: HttpResponse(status=204)),
     path("api/health/", health_check, name="health_check"),
-    # API documentation — access controlled by SPECTACULAR_SETTINGS['SERVE_PERMISSIONS']:
-    # open in dev (DEBUG=True), restricted to is_staff in production (DEBUG=False).
-    # Access in prod: log in at /admin/login via Authentik — sets session cookie; navigate to /api/docs/ directly.
+    # API documentation — admin-only via SPECTACULAR_SETTINGS['SERVE_PERMISSIONS'] (is_staff).
+    # Sign in at /admin/login via Authentik, then open /api/docs/ in the same browser.
     path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
     path("api/docs/", SpectacularSwaggerView.as_view(url_name="schema"), name="swagger-ui"),
     path("api/redoc/", SpectacularRedocView.as_view(url_name="schema"), name="redoc"),

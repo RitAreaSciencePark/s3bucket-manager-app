@@ -10,7 +10,7 @@ import { useAutoError } from '../hooks/useAutoMessage'
  * Supports inline file viewing for images, text, PDF via FileViewer modal.
  */
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useLayoutEffect, useRef } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import { authAPI, bucketAPI, getApiError } from '../services/api'
 import Navbar from './Navbar'
@@ -18,6 +18,97 @@ import ShareModal from './ShareModal'
 import FileViewer from './FileViewer'
 import { formatDateTime, formatSize } from '../utils/format'
 import type { User, BucketDetail as BucketDetailType, BucketAccessList } from '../types'
+
+
+type FileActionsMenuProps = {
+  fileKey: string
+  bucketId: string
+  isNexus: boolean
+  isViewable: boolean
+  canUpload: boolean
+  isOpen: boolean
+  onToggle: (e: React.MouseEvent) => void
+  onClose: () => void
+  onDownload: () => void
+  onView: () => void
+  onDelete: () => void
+}
+
+function FileActionsMenu({
+  fileKey,
+  bucketId,
+  isNexus,
+  isViewable,
+  canUpload,
+  isOpen,
+  onToggle,
+  onClose,
+  onDownload,
+  onView,
+  onDelete,
+}: FileActionsMenuProps) {
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const dropdownRef = useRef<HTMLDivElement>(null)
+  const [placement, setPlacement] = useState<'above' | 'below'>('below')
+
+  useLayoutEffect(() => {
+    if (!isOpen || !triggerRef.current || !dropdownRef.current) return
+    const trigger = triggerRef.current.getBoundingClientRect()
+    const menuHeight = dropdownRef.current.offsetHeight
+    const spaceBelow = window.innerHeight - trigger.bottom
+    const spaceAbove = trigger.top
+    setPlacement(spaceBelow < menuHeight && spaceAbove > spaceBelow ? 'above' : 'below')
+  }, [isOpen, isNexus, isViewable, canUpload])
+
+  return (
+    <div className="file-actions-menu">
+      <button
+        ref={triggerRef}
+        type="button"
+        className="file-actions-trigger"
+        aria-expanded={isOpen}
+        onClick={onToggle}
+      >
+        Show
+      </button>
+      {isOpen && (
+        <div
+          ref={dropdownRef}
+          className="file-actions-dropdown"
+          data-placement={placement}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button type="button" className="file-actions-item" onClick={onDownload}>
+            Download
+          </button>
+          {isNexus && (
+            <Link
+              to={`/buckets/${bucketId}/nexus?file=${bucketAPI.encodeFileKey(fileKey)}`}
+              className="file-actions-item"
+              onClick={onClose}
+            >
+              View
+            </Link>
+          )}
+          {isViewable && (
+            <button type="button" className="file-actions-item" onClick={onView}>
+              View
+            </button>
+          )}
+          {canUpload && (
+            <button
+              type="button"
+              className="file-actions-item file-actions-item-danger"
+              onClick={onDelete}
+            >
+              Delete
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
 
 function BucketDetail() {
   const { id } = useParams<{ id: string }>()
@@ -426,6 +517,7 @@ function BucketDetail() {
             </div>
           )}
           <div className="files-table-container files-table-container--detail">
+            <div className="files-table-scroll--detail">
             <table className="files-table files-table--detail">
               <thead>
                 <tr>
@@ -450,75 +542,38 @@ function BucketDetail() {
                     </td>
                     <td className="files-col-modified">{formatDateTime(file.last_modified)}</td>
                     <td className="files-col-actions">
-                      <div className="file-actions-menu">
-                        <button
-                          type="button"
-                          className="file-actions-trigger"
-                          aria-expanded={menuOpen}
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            setOpenActionsKey(menuOpen ? null : file.key)
-                          }}
-                        >
-                          Show
-                        </button>
-                        {menuOpen && (
-                          <div
-                            className="file-actions-dropdown"
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            <button
-                              type="button"
-                              className="file-actions-item"
-                              onClick={() => {
-                                setOpenActionsKey(null)
-                                handleDownload(file.key)
-                              }}
-                            >
-                              Download
-                            </button>
-                            {isNexus && (
-                              <Link
-                                to={`/buckets/${id}/nexus?file=${bucketAPI.encodeFileKey(file.key)}`}
-                                className="file-actions-item"
-                                onClick={() => setOpenActionsKey(null)}
-                              >
-                                View
-                              </Link>
-                            )}
-                            {isViewable && (
-                              <button
-                                type="button"
-                                className="file-actions-item"
-                                onClick={() => {
-                                  setOpenActionsKey(null)
-                                  setViewingFile({ key: file.key, size: file.size })
-                                }}
-                              >
-                                View
-                              </button>
-                            )}
-                            {canUpload && (
-                              <button
-                                type="button"
-                                className="file-actions-item file-actions-item-danger"
-                                onClick={() => {
-                                  setOpenActionsKey(null)
-                                  handleDeleteFile(file.key)
-                                }}
-                              >
-                                Delete
-                              </button>
-                            )}
-                          </div>
-                        )}
-                      </div>
+                      <FileActionsMenu
+                        fileKey={file.key}
+                        bucketId={id!}
+                        isNexus={isNexus}
+                        isViewable={Boolean(isViewable)}
+                        canUpload={canUpload}
+                        isOpen={menuOpen}
+                        onToggle={(e) => {
+                          e.stopPropagation()
+                          setOpenActionsKey(menuOpen ? null : file.key)
+                        }}
+                        onClose={() => setOpenActionsKey(null)}
+                        onDownload={() => {
+                          setOpenActionsKey(null)
+                          handleDownload(file.key)
+                        }}
+                        onView={() => {
+                          setOpenActionsKey(null)
+                          setViewingFile({ key: file.key, size: file.size })
+                        }}
+                        onDelete={() => {
+                          setOpenActionsKey(null)
+                          handleDeleteFile(file.key)
+                        }}
+                      />
                     </td>
                   </tr>
                   )
                 })}
               </tbody>
             </table>
+            </div>
             <p className="file-count" style={{ padding: '0.5rem 1rem' }}>
               {bucket.files.length} file{bucket.files.length !== 1 ? 's' : ''}
             </p>

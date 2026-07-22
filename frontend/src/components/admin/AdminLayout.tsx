@@ -2,7 +2,7 @@ import { useEffect } from 'react'
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { adminAPI, authStorage } from '../../services/api'
 
-const NAV_ITEMS = [
+const NAV_ITEMS: Array<{ to: string; label: string; external?: boolean }> = [
   { to: '/admin/buckets', label: 'Buckets' },
   { to: '/admin/users', label: 'Users' },
   { to: '/admin/uo-mappings', label: 'UO Mappings' },
@@ -12,6 +12,7 @@ const NAV_ITEMS = [
   { to: '/admin/file-deviations', label: 'Deviations' },
   { to: '/admin/file-formats', label: 'File Formats' },
   { to: '/admin/tenant-docs', label: 'Tenant Docs' },
+  { to: '/api/docs/', label: 'API Docs', external: true },
 ]
 
 function AdminLayout() {
@@ -39,15 +40,27 @@ function AdminLayout() {
           <span className="admin-sidebar-subtitle">Admin Panel</span>
         </div>
         <nav className="admin-nav">
-          {NAV_ITEMS.map((item) => (
-            <NavLink
-              key={item.to}
-              to={item.to}
-              className={({ isActive }) => `admin-nav-link${isActive ? ' active' : ''}`}
-            >
-              {item.label}
-            </NavLink>
-          ))}
+          {NAV_ITEMS.map((item) =>
+            'external' in item && item.external ? (
+              <a
+                key={item.to}
+                href={item.to}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="admin-nav-link"
+              >
+                {item.label}
+              </a>
+            ) : (
+              <NavLink
+                key={item.to}
+                to={item.to}
+                className={({ isActive }) => `admin-nav-link${isActive ? ' active' : ''}`}
+              >
+                {item.label}
+              </NavLink>
+            )
+          )}
         </nav>
         <div className="admin-sidebar-footer">
           <span className="admin-sidebar-user">{adminUser}</span>

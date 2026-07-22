@@ -8,14 +8,20 @@ from django.contrib.sessions.backends.db import SessionStore
 from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
-from django.test import TestCase, override_settings
+from django.test import Client, TestCase, override_settings
 from django.urls import Resolver404, resolve
+from django.utils import timezone
 from rest_framework.test import APIRequestFactory, force_authenticate
 
 from social_django.models import UserSocialAuth
+from social_core.exceptions import AuthForbidden
 
 from storage.middleware import OAuthExceptionRedirectMiddleware, OAuthNextValidationMiddleware
-from storage.pipeline import extract_tenant_info, persist_authentik_groups
+from storage.pipeline import (
+    associate_by_ceph_username,
+    extract_tenant_info,
+    persist_authentik_groups,
+)
 from storage.views.auth import exchange_token
 from storage.services import permissions as bucket_permissions
 from storage.tokens import AdminRefreshToken
@@ -36,7 +42,9 @@ from storage.views.admin import (
     AdminExchangeThrottle,
     admin_bucket_detail,
     admin_buckets,
+    admin_create_tenant,
     admin_exchange_token,
+    admin_group_mapping_delete,
     admin_group_mappings,
     admin_membership_files,
     admin_sync_refresh,
@@ -272,6 +280,45 @@ class AdminAuthSecurityTests(TestCase):
         )
         self.assertIsNone(bucket_permissions.get_user_permission(user, bucket))
 
+    def test_revoked_membership_blocks_existing_bucket_permission(self):
+        user = User.objects.create_user(
+            username="revoked-user",
+            email="revoked@example.com",
+            external_id="sub-revoked",
+        )
+        tenant = Tenant.objects.create(
+            code="REVOKED",
+            name="Revoked",
+            rgwsquared_structure="REVOKED",
+        )
+        GroupTenantMapping.objects.create(
+            tenant=tenant,
+            authentik_group="revoked-users",
+            role="rw",
+        )
+        membership = TenantMembership.objects.create(
+            user=user,
+            tenant=tenant,
+            ceph_username="revoked-user",
+            role="rw",
+            access_revoked_at=timezone.now(),
+            access_revocation_reason="mapping_removed",
+        )
+        bucket = Bucket.objects.create(
+            tenant=tenant,
+            name="project",
+            bucket_type=Bucket.LOCAL,
+        )
+        BucketPermission.objects.create(
+            user=user,
+            bucket=bucket,
+            permission="owner",
+            source="local",
+        )
+
+        self.assertFalse(bucket_permissions.can_create_bucket(membership))
+        self.assertIsNone(bucket_permissions.get_user_permission(user, bucket))
+
     def test_pipeline_syncs_and_revokes_staff_from_admin_group(self):
         user = User.objects.create_user(
             username="oauth-admin",
@@ -319,14 +366,48 @@ class AdminAuthSecurityTests(TestCase):
 
     def test_persist_authentik_groups_writes_extra_data(self):
         backend = type("Backend", (), {"name": "authentik"})()
+        social = UserSocialAuth.objects.get(user=self.admin, provider="authentik")
         persist_authentik_groups(
             backend,
             {},
-            {"groups": [ADMIN_GROUP, "other-group"]},
+            {
+                "sub": social.uid,
+                "groups": [ADMIN_GROUP, "other-group"],
+                "preferred_username": "admin",
+            },
             user=self.admin,
+            social=social,
         )
-        social = UserSocialAuth.objects.get(user=self.admin, provider="authentik")
+        social.refresh_from_db()
         self.assertEqual(social.extra_data.get("groups"), [ADMIN_GROUP, "other-group"])
+        self.assertEqual(social.extra_data.get("preferred_username"), "admin")
+
+    def test_persist_authentik_groups_updates_only_current_association(self):
+        backend = type("Backend", (), {"name": "authentik"})()
+        primary = UserSocialAuth.objects.get(user=self.admin, provider="authentik")
+        secondary = UserSocialAuth.objects.create(
+            user=self.admin,
+            provider="authentik",
+            uid="sub-admin-secondary",
+            extra_data={"groups": ["tenant-old"]},
+        )
+
+        persist_authentik_groups(
+            backend,
+            {},
+            {
+                "sub": secondary.uid,
+                "groups": [ADMIN_GROUP, "tenant-new"],
+                "preferred_username": "admin-secondary",
+            },
+            user=self.admin,
+            social=secondary,
+        )
+
+        primary.refresh_from_db()
+        secondary.refresh_from_db()
+        self.assertEqual(primary.extra_data["groups"], [ADMIN_GROUP])
+        self.assertEqual(secondary.extra_data["groups"], [ADMIN_GROUP, "tenant-new"])
 
     def test_admin_only_user_gets_hint_on_user_exchange(self):
         request = self.factory.get("/api/auth/token/")
@@ -335,6 +416,55 @@ class AdminAuthSecurityTests(TestCase):
         response = exchange_token(request)
         self.assertEqual(response.status_code, 403, response.data)
         self.assertIn("/admin/login", response.data["error"])
+
+    def test_distinct_oidc_subjects_can_share_email(self):
+        other = User.objects.create_user(
+            username="admin-secondary",
+            email=self.admin.email,
+            external_id="sub-admin-secondary-email",
+        )
+
+        self.assertNotEqual(other.id, self.admin.id)
+        self.assertEqual(User.objects.filter(email=self.admin.email).count(), 2)
+
+    def test_ceph_username_bridge_claims_only_sync_placeholders(self):
+        tenant = Tenant.objects.create(
+            code="BRIDGE",
+            name="Bridge",
+            access_model=Tenant.RGWSQUARED_SYNCED,
+        )
+        TenantMembership.objects.create(
+            user=self.admin,
+            tenant=tenant,
+            ceph_username="shared-name",
+            role="rw",
+        )
+
+        result = associate_by_ceph_username(
+            None,
+            {},
+            {"preferred_username": "shared-name"},
+        )
+
+        self.assertIsNone(result)
+
+        placeholder = User.objects.create_user(
+            username="placeholder",
+            email="placeholder@placeholder.local",
+            external_id="ms:BRIDGE:placeholder",
+        )
+        TenantMembership.objects.create(
+            user=placeholder,
+            tenant=tenant,
+            ceph_username="placeholder",
+            role="ro",
+        )
+        result = associate_by_ceph_username(
+            None,
+            {},
+            {"preferred_username": "placeholder"},
+        )
+        self.assertEqual(result["user"], placeholder)
 
 
 @override_settings(
@@ -525,6 +655,43 @@ class AdminMembershipUsersTests(TestCase):
         self.assertEqual(rows["TENANT_B"]["file_count"], 2)
         self.assertEqual(rows["TENANT_B"]["total_file_size"], 1000)
 
+    def test_admin_users_distinguishes_authorized_revoked_and_not_configured(self):
+        GroupTenantMapping.objects.create(
+            tenant=self.tenant_a,
+            authentik_group="tenant-a-users",
+            role="rw",
+        )
+        self.membership_b.access_revoked_at = timezone.now()
+        self.membership_b.access_revocation_reason = "mapping_removed"
+        self.membership_b.access_revoked_group = "tenant-b-users"
+        self.membership_b.save(
+            update_fields=[
+                "access_revoked_at",
+                "access_revocation_reason",
+                "access_revoked_group",
+            ]
+        )
+        tenant_c = Tenant.objects.create(
+            code="TENANT_C",
+            name="Tenant C",
+            rgwsquared_structure="TENANT_C",
+        )
+        membership_c = TenantMembership.objects.create(
+            user=self.user,
+            tenant=tenant_c,
+            ceph_username="researcher-c",
+            role="ro",
+        )
+
+        response = admin_users(self.admin_request("/api/admin/users/"))
+
+        rows = {row["tenant_code"]: row for row in response.data}
+        self.assertEqual(rows["TENANT_A"]["access_status"], "authorized")
+        self.assertEqual(rows["TENANT_B"]["access_status"], "revoked")
+        self.assertEqual(rows["TENANT_B"]["access_revoked_group"], "tenant-b-users")
+        self.assertEqual(rows["TENANT_C"]["access_status"], "not_configured")
+        self.assertTrue(TenantMembership.objects.filter(id=membership_c.id).exists())
+
     def test_admin_users_tenant_filter_is_membership_scoped(self):
         request = self.admin_request("/api/admin/users/?tenant_code=TENANT_B")
         response = admin_users(request)
@@ -585,6 +752,11 @@ class TenantActivationSummaryTests(TestCase):
             code=code,
             name=f"{code} Lab",
             rgwsquared_structure=code,
+            access_model=(
+                Tenant.RGWSQUARED_SYNCED
+                if code == "NFFADI"
+                else Tenant.AUTHENTIK_MANAGED
+            ),
             is_active=True,
         )
 
@@ -601,6 +773,36 @@ class TenantActivationSummaryTests(TestCase):
             role=role,
             uo_code=uo_code,
         )
+
+    def test_tenant_creation_requires_explicit_access_model(self):
+        request = self.factory.post(
+            "/api/admin/tenants/create/",
+            {"structure": "LAB", "name": "Lab"},
+            format="json",
+        )
+        force_authenticate(request, user=self.admin)
+
+        response = admin_create_tenant(request)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("access_model", response.data["error"])
+
+    def test_nffadi_rejects_authentik_managed_access_model(self):
+        request = self.factory.post(
+            "/api/admin/tenants/create/",
+            {
+                "structure": "NFFADI",
+                "name": "NFFA-DI",
+                "access_model": Tenant.AUTHENTIK_MANAGED,
+            },
+            format="json",
+        )
+        force_authenticate(request, user=self.admin)
+
+        response = admin_create_tenant(request)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(Tenant.RGWSQUARED_SYNCED, response.data["error"])
 
     def test_uninitialized_rgwsquared_structure_is_not_fully_active(self):
         rows = self.activation_rows(["LAB"], {"LAB": {"initialized": False}})
@@ -796,6 +998,7 @@ class AdminGroupMappingPolicyTests(TestCase):
             code="NFFADI",
             name="NFFA-DI",
             rgwsquared_structure="NFFADI",
+            access_model=Tenant.RGWSQUARED_SYNCED,
         )
         self.orbit = Tenant.objects.create(
             code="ORBIT",
@@ -826,6 +1029,128 @@ class AdminGroupMappingPolicyTests(TestCase):
         response = self.post_mapping(self.orbit, "orbit-ext", "ro")
         self.assertEqual(response.status_code, 201, response.data)
 
+    def test_deleting_last_mapping_revokes_existing_memberships(self):
+        mapping = GroupTenantMapping.objects.create(
+            tenant=self.orbit,
+            authentik_group="orbit-users",
+            role="rw",
+        )
+        user = User.objects.create_user(
+            username="orbit-user",
+            email="orbit-user@example.com",
+            external_id="sub-orbit-user",
+        )
+        membership = TenantMembership.objects.create(
+            user=user,
+            tenant=self.orbit,
+            ceph_username="orbit-user",
+            role="rw",
+        )
+        link_authentik_user(user, groups=["orbit-users"])
+        request = self.factory.delete(f"/api/admin/group-mappings/{mapping.id}/")
+        force_admin(request, self.admin)
+
+        response = admin_group_mapping_delete(request, mapping.id)
+
+        self.assertEqual(response.status_code, 204)
+        membership.refresh_from_db()
+        self.assertIsNotNone(membership.access_revoked_at)
+        self.assertEqual(membership.access_revocation_reason, "mapping_removed")
+        self.assertEqual(membership.access_revoked_group, "orbit-users")
+        self.assertTrue(User.objects.filter(id=user.id).exists())
+
+
+    def test_deleting_rw_mapping_falls_back_to_verified_ro_group(self):
+        rw_mapping = GroupTenantMapping.objects.create(
+            tenant=self.orbit,
+            authentik_group="orbit-users",
+            role="rw",
+        )
+        GroupTenantMapping.objects.create(
+            tenant=self.orbit,
+            authentik_group="orbit-ext",
+            role="ro",
+        )
+        user = User.objects.create_user(
+            username="dual-role",
+            email="dual-role@example.com",
+            external_id="sub-dual-role",
+        )
+        membership = TenantMembership.objects.create(
+            user=user,
+            tenant=self.orbit,
+            ceph_username="dual-role",
+            role="rw",
+        )
+        bucket = Bucket.objects.create(
+            tenant=self.orbit,
+            name="dual-role-project",
+            bucket_type=Bucket.LOCAL,
+        )
+        BucketPermission.objects.create(
+            user=user,
+            bucket=bucket,
+            permission="rw",
+            source="rgwsquared",
+        )
+        link_authentik_user(user, groups=["orbit-users", "orbit-ext"])
+        request = self.factory.delete(f"/api/admin/group-mappings/{rw_mapping.id}/")
+        force_admin(request, self.admin)
+
+        response = admin_group_mapping_delete(request, rw_mapping.id)
+
+        self.assertEqual(response.status_code, 204)
+        membership.refresh_from_db()
+        self.assertIsNone(membership.access_revoked_at)
+        self.assertEqual(membership.role, "ro")
+        self.assertEqual(bucket_permissions.get_user_permission(user, bucket), "ro")
+        self.assertFalse(bucket_permissions.can_upload_file(user, bucket))
+
+    def test_recreated_mapping_restores_only_after_matching_login(self):
+        mapping = GroupTenantMapping.objects.create(
+            tenant=self.orbit,
+            authentik_group="orbit-users",
+            role="rw",
+        )
+        user = User.objects.create_user(
+            username="returning-user",
+            email="returning@example.com",
+            external_id="sub-returning",
+        )
+        membership = TenantMembership.objects.create(
+            user=user,
+            tenant=self.orbit,
+            ceph_username="returning-user",
+            role="rw",
+        )
+        link_authentik_user(user, groups=["orbit-users"])
+        request = self.factory.delete(f"/api/admin/group-mappings/{mapping.id}/")
+        force_admin(request, self.admin)
+        admin_group_mapping_delete(request, mapping.id)
+        membership.refresh_from_db()
+        self.assertIsNotNone(membership.access_revoked_at)
+
+        GroupTenantMapping.objects.create(
+            tenant=self.orbit,
+            authentik_group="orbit-new-users",
+            role="rw",
+        )
+        membership.refresh_from_db()
+        self.assertIsNotNone(membership.access_revoked_at)
+
+        with patch("storage.pipeline._sync_rgwsquared_user_access", return_value=True):
+            extract_tenant_info(
+                None,
+                {},
+                {
+                    "preferred_username": "returning-user",
+                    "groups": ["orbit-new-users"],
+                },
+                user=user,
+            )
+        membership.refresh_from_db()
+        self.assertIsNone(membership.access_revoked_at)
+        self.assertEqual(membership.access_revocation_reason, "")
 
 @override_settings(
     RGWSQUARED_URL="http://rgw",
@@ -844,6 +1169,7 @@ class AuthPipelineTenantPolicyTests(TestCase):
             code="NFFADI",
             name="NFFA-DI",
             rgwsquared_structure="NFFADI",
+            access_model=Tenant.RGWSQUARED_SYNCED,
         )
         self.orbit = Tenant.objects.create(
             code="ORBIT",
@@ -924,6 +1250,66 @@ class AuthPipelineTenantPolicyTests(TestCase):
         self.assertFalse(TenantMembership.objects.filter(user=self.user, tenant=self.nffadi).exists())
         orbit_membership = TenantMembership.objects.get(user=self.user, tenant=self.orbit)
         self.assertEqual(orbit_membership.role, "rw")
+        self.assertIsNone(orbit_membership.access_revoked_at)
+
+    def test_current_groups_revoke_stale_tenant_without_blocking_valid_tenant(self):
+        GroupTenantMapping.objects.create(
+            tenant=self.orbit,
+            authentik_group="orbit-users",
+            role="rw",
+        )
+        stale = TenantMembership.objects.create(
+            user=self.user,
+            tenant=self.nffadi,
+            ceph_username="alice",
+            role="rw",
+        )
+
+        with patch("storage.pipeline._sync_rgwsquared_user_access", return_value=True):
+            extract_tenant_info(
+                None,
+                {},
+                {
+                    "preferred_username": "alice",
+                    "groups": ["orbit-users", "unrelated-group"],
+                },
+                user=self.user,
+            )
+
+        stale.refresh_from_db()
+        orbit = TenantMembership.objects.get(user=self.user, tenant=self.orbit)
+        self.assertIsNotNone(stale.access_revoked_at)
+        self.assertIsNone(orbit.access_revoked_at)
+
+    def test_duplicate_ceph_username_is_denied_without_server_error(self):
+        GroupTenantMapping.objects.create(
+            tenant=self.orbit,
+            authentik_group="orbit-users",
+            role="rw",
+        )
+        other = User.objects.create_user(
+            username="other",
+            email="other@example.com",
+            external_id="sub-other",
+        )
+        TenantMembership.objects.create(
+            user=other,
+            tenant=self.orbit,
+            ceph_username="alice",
+            role="rw",
+        )
+
+        with self.assertRaises(AuthForbidden):
+            extract_tenant_info(
+                type("Backend", (), {"name": "authentik"})(),
+                {},
+                {"preferred_username": "alice", "groups": ["orbit-users"]},
+                user=self.user,
+            )
+
+        self.assertFalse(
+            TenantMembership.objects.filter(user=self.user, tenant=self.orbit).exists()
+        )
 
 
 class AdminCSVUOTests(TestCase):
@@ -942,6 +1328,7 @@ class AdminCSVUOTests(TestCase):
             code="NFFADI",
             name="NFFA-DI",
             rgwsquared_structure="NFFADI",
+            access_model=Tenant.RGWSQUARED_SYNCED,
         )
         UOMapping.objects.create(
             tenant=self.tenant,
@@ -1075,7 +1462,13 @@ class BucketLifecycleTests(TestCase):
             defaults={
                 "name": "NFFA-DI",
                 "rgwsquared_structure": "NFFADI",
+                "access_model": Tenant.RGWSQUARED_SYNCED,
             },
+        )
+        GroupTenantMapping.objects.get_or_create(
+            tenant=self.tenant,
+            authentik_group="nffa-di-users",
+            defaults={"role": "rw"},
         )
         self.owner = self.create_user("owner")
         self.target = self.create_user("target")
@@ -1314,12 +1707,41 @@ class BucketLifecycleTests(TestCase):
 
 
 class SyncServiceTests(TestCase):
+    def test_authentik_managed_refresh_skips_unregistered_upstream_users(self):
+        tenant = Tenant.objects.create(
+            code="LIFESCIENCE",
+            name="Life Science",
+            rgwsquared_structure="LIFESCIENCE",
+            access_model=Tenant.AUTHENTIK_MANAGED,
+        )
+
+        class SyncClient:
+            def get_structure_info(self, structure):
+                return {"initialized": True}
+
+            def list_buckets(self, structure):
+                return []
+
+            def list_users(self, structure):
+                return ["not-registered"]
+
+            def get_user_info(self, structure, username):
+                raise AssertionError("unregistered users must be skipped before userInfo")
+
+        stats = refresh_local_cache(tenant, client=SyncClient())
+
+        self.assertEqual(stats["users_synced"], 0)
+        self.assertEqual(stats["users_skipped_unregistered"], 1)
+        self.assertFalse(TenantMembership.objects.filter(tenant=tenant).exists())
+        self.assertFalse(User.objects.filter(external_id__startswith="ms:").exists())
+
     def test_refresh_uses_bucket_list_and_user_info_without_credentials(self):
         tenant, _ = Tenant.objects.update_or_create(
             code="NFFADI",
             defaults={
                 "name": "NFFA-DI",
                 "rgwsquared_structure": "NFFADI",
+                "access_model": Tenant.RGWSQUARED_SYNCED,
             },
         )
 
@@ -1367,6 +1789,7 @@ class SyncServiceTests(TestCase):
         self.assertEqual(manual.bucket_type, Bucket.LOCAL)
 
         membership = TenantMembership.objects.get(tenant=tenant, ceph_username="alice")
+        self.assertIsNone(membership.access_revoked_at)
         self.assertFalse(hasattr(membership, "s3_access_key"))
         self.assertFalse(hasattr(tenant, "mgmt_access_key"))
         self.assertTrue(
@@ -1412,7 +1835,7 @@ class SyncServiceTests(TestCase):
     def test_refresh_preserves_local_owner_on_manual_bucket(self):
         tenant, _ = Tenant.objects.update_or_create(
             code="NFFADI",
-            defaults={"name": "NFFA-DI", "rgwsquared_structure": "NFFADI"},
+            defaults={"name": "NFFA-DI", "rgwsquared_structure": "NFFADI", "access_model": Tenant.RGWSQUARED_SYNCED},
         )
         owner = User.objects.create_user(
             username="alice",
@@ -1520,7 +1943,7 @@ class SyncServiceTests(TestCase):
     def test_refresh_clears_stale_uo_from_read_only_membership(self):
         tenant, _ = Tenant.objects.update_or_create(
             code="NFFADI",
-            defaults={"name": "NFFA-DI", "rgwsquared_structure": "NFFADI"},
+            defaults={"name": "NFFA-DI", "rgwsquared_structure": "NFFADI", "access_model": Tenant.RGWSQUARED_SYNCED},
         )
         UOMapping.objects.create(
             tenant=tenant,
@@ -1561,12 +1984,139 @@ class SyncServiceTests(TestCase):
         self.assertEqual(membership.uo_code, "")
         self.assertEqual(stats["uo_codes_cleared"], 1)
 
+    def test_refresh_discovers_objects_without_inventing_uploader(self):
+        tenant = Tenant.objects.create(
+            code="LIFE",
+            name="Life",
+            rgwsquared_structure="LIFE",
+            access_model=Tenant.RGWSQUARED_SYNCED,
+        )
+
+        class SyncClient:
+            def get_structure_info(self, structure):
+                return {"initialized": True}
+
+            def list_buckets(self, structure):
+                return [{"name": "LIFE:project", "auto": True, "manual": False}]
+
+            def list_users(self, structure):
+                return ["alice"]
+
+            def get_user_info(self, structure, username):
+                return {"RWBuckets": ["LIFE:project"], "ROBuckets": []}
+
+        class Paginator:
+            def paginate(self, **kwargs):
+                return [{
+                    "Contents": [{
+                        "Key": "legacy.dat",
+                        "Size": 42,
+                        "ETag": '"legacy-etag"',
+                        "LastModified": timezone.now(),
+                    }]
+                }]
+
+        s3 = type("S3", (), {"get_paginator": lambda self, name: Paginator()})()
+        with patch("storage.services.sync_service.get_mgmt_s3_client", return_value=s3):
+            stats = refresh_local_cache(tenant, client=SyncClient())
+
+        record = FileUploadRecord.objects.get(file_key="legacy.dat")
+        self.assertIsNone(record.uploaded_by)
+        self.assertEqual(record.origin, FileUploadRecord.DISCOVERED)
+        self.assertEqual(record.object_etag, "legacy-etag")
+        self.assertEqual(stats["objects_synced"], 1)
+        self.assertEqual(stats["objects_discovered"], 1)
+
+    def test_refresh_reattributes_changed_objects_and_preserves_cache_on_list_error(self):
+        tenant = Tenant.objects.create(
+            code="MAT",
+            name="Materials",
+            rgwsquared_structure="MAT",
+            access_model=Tenant.RGWSQUARED_SYNCED,
+        )
+        user = User.objects.create_user(
+            username="alice-mat",
+            email="alice@example.com",
+            external_id="sub-alice-mat",
+        )
+        bucket = Bucket.objects.create(
+            tenant=tenant,
+            name="project",
+            bucket_type=Bucket.PROPOSAL,
+        )
+        BucketPermission.objects.create(
+            bucket=bucket,
+            user=user,
+            permission="rw",
+            source="rgwsquared",
+        )
+        changed = FileUploadRecord.objects.create(
+            bucket=bucket,
+            file_key="changed.dat",
+            uploaded_by=user,
+            file_size=1,
+            origin=FileUploadRecord.APP,
+            object_etag="old-etag",
+        )
+        stale = FileUploadRecord.objects.create(
+            bucket=bucket,
+            file_key="stale.dat",
+            uploaded_by=user,
+            file_size=1,
+            origin=FileUploadRecord.APP,
+            object_etag="stale-etag",
+        )
+
+        class Paginator:
+            def paginate(self, **kwargs):
+                return [{
+                    "Contents": [{
+                        "Key": "changed.dat",
+                        "Size": 99,
+                        "ETag": '"new-etag"',
+                        "LastModified": timezone.now(),
+                    }]
+                }]
+
+        s3 = type("S3", (), {"get_paginator": lambda self, name: Paginator()})()
+        stats = {"objects_synced": 0, "objects_discovered": 0,
+                 "object_records_removed": 0, "object_sync_errors": 0}
+        from storage.services.sync_service import _sync_authorized_bucket_objects
+
+        with patch("storage.services.sync_service.get_mgmt_s3_client", return_value=s3):
+            _sync_authorized_bucket_objects(tenant, stats, object())
+
+        changed.refresh_from_db()
+        self.assertIsNone(changed.uploaded_by)
+        self.assertEqual(changed.origin, FileUploadRecord.DISCOVERED)
+        self.assertFalse(FileUploadRecord.objects.filter(id=stale.id).exists())
+        self.assertEqual(stats["object_records_removed"], 1)
+
+        class FailingPaginator:
+            def paginate(self, **kwargs):
+                raise RuntimeError("S3 unavailable")
+
+        failing_s3 = type(
+            "FailingS3",
+            (),
+            {"get_paginator": lambda self, name: FailingPaginator()},
+        )()
+        with patch(
+            "storage.services.sync_service.get_mgmt_s3_client",
+            return_value=failing_s3,
+        ):
+            _sync_authorized_bucket_objects(tenant, stats, object())
+
+        self.assertTrue(FileUploadRecord.objects.filter(id=changed.id).exists())
+        self.assertEqual(stats["object_sync_errors"], 1)
+
     def test_fetch_mgmt_keys_requires_initialized_structure(self):
         tenant, _ = Tenant.objects.update_or_create(
             code="NFFADI",
             defaults={
                 "name": "NFFA-DI",
                 "rgwsquared_structure": "NFFADI",
+                "access_model": Tenant.RGWSQUARED_SYNCED,
             },
         )
 
@@ -1659,3 +2209,49 @@ class RGWSquaredUserCreateTests(TestCase):
             )
 
         self.assertFalse(result)
+
+
+@override_settings(AUTHENTIK_ADMIN_GROUP=ADMIN_GROUP, DEBUG=True)
+class ApiDocumentationAccessTests(TestCase):
+    """OpenAPI schema and Swagger UI are admin-only in all environments."""
+
+    def setUp(self):
+        self.client = Client()
+        self.admin = User.objects.create_user(
+            username="docs-admin",
+            email="docs-admin@example.com",
+            external_id="sub-docs-admin",
+            password="unused",
+            is_staff=True,
+            is_approved=True,
+            idp_source="authentik",
+        )
+        self.regular = User.objects.create_user(
+            username="docs-user",
+            email="docs-user@example.com",
+            external_id="sub-docs-user",
+            password="unused",
+            is_staff=False,
+            is_approved=True,
+            idp_source="authentik",
+        )
+        link_authentik_user(self.admin)
+        link_authentik_user(self.regular, groups=[])
+
+    def test_anonymous_denied_schema_and_docs(self):
+        for path in ("/api/schema/", "/api/docs/", "/api/redoc/"):
+            response = self.client.get(path)
+            # JWT auth advertises Bearer, so DRF may return 401 instead of 403.
+            self.assertIn(response.status_code, (401, 403), path)
+
+    def test_non_staff_denied_schema_and_docs(self):
+        self.client.force_login(self.regular)
+        for path in ("/api/schema/", "/api/docs/", "/api/redoc/"):
+            response = self.client.get(path)
+            self.assertEqual(response.status_code, 403, path)
+
+    def test_staff_session_allowed_schema_and_docs(self):
+        self.client.force_login(self.admin)
+        self.assertEqual(self.client.get("/api/schema/").status_code, 200)
+        self.assertEqual(self.client.get("/api/docs/").status_code, 200)
+        self.assertEqual(self.client.get("/api/redoc/").status_code, 200)

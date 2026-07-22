@@ -13,6 +13,7 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 .coverage
+coverage.xml
 *.py[cod]
 *$py.class
 *.so

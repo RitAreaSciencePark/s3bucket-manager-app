@@ -51,7 +51,7 @@
 #
 #   backend/frontend/all:
 #     1. podman build -t ghcr.io/luisfpal/buckets-explorer-<component>:latest
-#     2. ghcr_login + podman push (packages are public; K3s pulls without credentials)
+#     2. ghcr_login + podman push; refresh the namespace pull secret
 #     3. kubectl rollout restart deployment/<component>  -n bucket-explorer
 #     4. kubectl rollout status (waits; imagePullPolicy: Always fetches new image)
 #
@@ -64,8 +64,9 @@
 #
 # PREREQUISITES:
 #   - k8s/.env with GHCR_TOKEN (classic PAT, write:packages scope)
-#   - SSH tunnel to K3s API running, or let 'access' set it up
-#   - KUBECONFIG set to /tmp/k3s-tunnel-kubeconfig.yaml (default)
+#   - Run './app.sh access' once per session (or when /tmp/k3s-tunnel-kubeconfig.yaml
+#     is missing) before deploy — it creates the SSH tunnel and kubeconfig file
+#   - KUBECONFIG set to /tmp/k3s-tunnel-kubeconfig.yaml (default; export in new shells)
 #   - Environment overlays in k8s/env/<env>/
 #   - Authentik running in authentik-bucket-explorer namespace (deployed by infra.sh)
 #
@@ -217,6 +218,31 @@ ghcr_login() {
     success "Authenticated to ghcr.io"
 }
 
+ensure_ghcr_pull_secret() (
+    if [ -z "${GHCR_TOKEN:-}" ]; then
+        fail "GHCR_TOKEN is not set. It is required to pull private GHCR packages."
+    fi
+
+    local auth_file
+    auth_file=$(mktemp)
+    trap 'rm -f "$auth_file"' EXIT
+    rm -f "$auth_file"
+
+    echo "${GHCR_TOKEN}" | podman login \
+        --authfile "$auth_file" \
+        ghcr.io -u "${GHCR_OWNER}" --password-stdin >/dev/null
+    chmod 600 "$auth_file"
+    kubectl -n "$NAMESPACE" create secret generic ghcr-pull-secret \
+        --from-file=.dockerconfigjson="$auth_file" \
+        --type=kubernetes.io/dockerconfigjson \
+        --dry-run=client -o yaml | kubectl apply -f -
+    kubectl -n "$NAMESPACE" wait --for=create serviceaccount/default \
+        --timeout=60s >/dev/null
+    kubectl -n "$NAMESPACE" patch serviceaccount default --type=strategic \
+        -p '{"imagePullSecrets":[{"name":"ghcr-pull-secret"}]}' >/dev/null
+    success "GHCR pull credentials configured in $NAMESPACE"
+)
+
 # ==============================================================================
 # Frontend build helper
 # ==============================================================================
@@ -278,8 +304,8 @@ apply_app_manifests_for_env() {
     # Step 1: namespace (idempotent — safe even if it already exists)
     kubectl apply -f "$APP_MANIFESTS_DIR/00-namespace.yaml"
 
-    # Step 2: app secrets (backend-secret) and backend ConfigMap
-    # Note: no imagePullSecret needed — GHCR packages are public (no auth required to pull)
+    # Step 2: registry credentials, app secrets, and backend ConfigMap
+    ensure_ghcr_pull_secret
     kubectl apply -f "$APP_SECRETS_FILE"
     kubectl apply -f "$BACKEND_CONFIG_FILE"
 
@@ -410,11 +436,12 @@ redeploy_component() {
     podman build -t "$image_name" -f "$build_dir/Containerfile" "$build_dir"
     success "Image built"
 
-    # Step 2: Push to GHCR (packages are public; K3s pulls without credentials; imagePullPolicy: Always)
+    # Step 2: Push to GHCR and refresh the namespace pull credential.
     ghcr_login
     info "Pushing to GHCR..."
     podman push "$image_name"
     success "Image pushed to ghcr.io"
+    ensure_ghcr_pull_secret
 
     # Step 3: Restart deployment — Always pull policy fetches the newly pushed image
     info "Restarting deployment..."

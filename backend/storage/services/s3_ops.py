@@ -69,13 +69,13 @@ def fetch_mgmt_keys(tenant, client=None):
     return access_key, secret_key
 
 
-def get_mgmt_s3_client(tenant):
+def get_mgmt_s3_client(tenant, client=None):
     """S3 client using transient tenant area-mgmt credentials."""
-    access_key, secret_key = fetch_mgmt_keys(tenant)
+    access_key, secret_key = fetch_mgmt_keys(tenant, client=client)
     return _make_s3_client(access_key, secret_key)
 
 
-def list_objects(s3_client, bare_name):
+def list_objects(s3_client, bare_name, *, raise_errors=False):
     """List all objects in a bucket. Returns list of {key, size, last_modified}."""
     files = []
     try:
@@ -87,9 +87,12 @@ def list_objects(s3_client, bare_name):
                         "key": obj["Key"],
                         "size": obj["Size"],
                         "last_modified": obj["LastModified"],
+                        "etag": str(obj.get("ETag", "")).strip('"'),
                     }
                 )
     except Exception as e:
+        if raise_errors:
+            raise
         logger.warning(f"Could not list objects in {bare_name}: {e}")
     return files
 
@@ -98,7 +101,7 @@ def upload_object(
     s3_client, bare_name, key, body, content_type="application/octet-stream"
 ):
     """Upload a file to a bucket."""
-    s3_client.put_object(
+    return s3_client.put_object(
         Bucket=bare_name,
         Key=key,
         Body=body,

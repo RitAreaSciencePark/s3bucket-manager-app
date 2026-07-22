@@ -11,7 +11,7 @@ import { useEffect, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
-import 'highlight.js/styles/github-dark-dimmed.css'
+import 'highlight.js/styles/github.css'
 
 interface MarkdownViewerProps {
   content: string
@@ -26,7 +26,7 @@ function MermaidBlock({ code }: { code: string }) {
     let cancelled = false
     import('mermaid').then(({ default: mermaid }) => {
       if (cancelled) return
-      mermaid.initialize({ startOnLoad: false, theme: 'default', securityLevel: 'loose' })
+      mermaid.initialize({ startOnLoad: false, theme: 'neutral', securityLevel: 'loose' })
       const id = 'mmd-' + Math.random().toString(36).slice(2)
       mermaid
         .render(id, code)

@@ -28,12 +28,8 @@ spec:
             - containerPort: 80
               name: http
           # nginx: serves pre-built static SPA files + reverse-proxies /api/* to backend-service.
-          # Entirely IO-bound — no computation happens here. The bundle is served from memory.
-          # 1 CPU / 1Gi (old value) was 10× over-provisioned and wasted namespace quota.
-          #
-          # DEV:  requests=50m/64Mi,   limits=200m/256Mi
-          # PROD: requests=100m/128Mi, limits=500m/512Mi  → handles hundreds of concurrent static
-          #       requests and thousands of API proxies per second; quota: ~0.5/8 CPU, ~0.5/32Gi.
+          # Entirely IO-bound. Prod steady-state observed ~1m CPU / ~28Mi RAM; same values as dev.
+          # requests=50m/64Mi, limits=200m/256Mi.
           resources:
             requests:
               memory: "64Mi"

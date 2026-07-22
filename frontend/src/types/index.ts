@@ -142,6 +142,10 @@ export interface AdminUser {
   tenant_name: string;
   role: string;
   uo_code: string;
+  access_status: 'authorized' | 'revoked' | 'not_configured';
+  access_revoked_at: string | null;
+  access_revocation_reason: '' | 'mapping_removed' | 'claim_missing';
+  access_revoked_group: string;
   last_login: string | null;
   file_count: number;
   total_file_size: number;
@@ -186,6 +190,7 @@ export interface AdminTenantActivation {
   group_mapping_ready: boolean;
   group_mapping_issue: string;
   required_group_name: string | null;
+  access_model: 'rgwsquared_synced' | 'authentik_managed' | null;
   role_source: 'authentik_group' | 'rgwsquared';
   suggested_rw_group: string;
   suggested_ro_group: string;
@@ -218,6 +223,7 @@ export interface CreateTenantPayload {
   structure: string;
   name: string;
   bucket_name_prefix?: string;
+  access_model: 'rgwsquared_synced' | 'authentik_managed';
 }
 
 export interface AdminUserFile {

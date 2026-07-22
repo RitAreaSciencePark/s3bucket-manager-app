@@ -7,9 +7,14 @@ import type { AdminTenant, AdminTenantActivation, CreateTenantPayload } from '..
 
 interface SyncStats {
   users_synced?: number
+  users_skipped_unregistered?: number
   buckets_synced?: number
   permissions_synced?: number
   users_deactivated?: number
+  objects_synced?: number
+  objects_discovered?: number
+  object_records_removed?: number
+  object_sync_errors?: number
   initialized?: boolean
 }
 
@@ -76,6 +81,7 @@ function TenantsView() {
   const [activateLoading, setActivateLoading] = useState(false)
   const [activateError, setActivateError] = useState<string | null>(null)
   const [activateResult, setActivateResult] = useState<ActivateResult | null>(null)
+  const [activationAccessModel, setActivationAccessModel] = useState<'' | 'rgwsquared_synced' | 'authentik_managed'>('')
 
   const [refreshingCode, setRefreshingCode] = useState<string | null>(null)
   const [refreshResults, setRefreshResults] = useState<Record<string, { ok: boolean; msg: string }>>({})
@@ -100,10 +106,11 @@ function TenantsView() {
     setActivating(structure)
     setActivateError(null)
     setActivateResult(null)
+    setActivationAccessModel(structure.toUpperCase() === 'NFFADI' ? 'rgwsquared_synced' : '')
   }
 
   async function handleActivate() {
-    if (!activating) return
+    if (!activating || !activationAccessModel) return
     setActivateLoading(true)
     setActivateError(null)
     setActivateResult(null)
@@ -112,6 +119,7 @@ function TenantsView() {
         structure: activating,
         name: activating,
         bucket_name_prefix: activating.toLowerCase(),
+        access_model: activationAccessModel,
       }
       const res = await adminAPI.createTenant(payload) as AdminTenant & { sync_stats?: SyncStats; sync_error?: string }
       setActivateResult({
@@ -133,7 +141,10 @@ function TenantsView() {
       const stats = await adminAPI.syncRefresh(code) as SyncStats
       setRefreshResults(prev => ({
         ...prev,
-        [code]: { ok: true, msg: `✓ ${stats.users_synced ?? 0} users, ${stats.buckets_synced ?? 0} buckets synced` },
+        [code]: {
+          ok: (stats.object_sync_errors ?? 0) === 0,
+          msg: `✓ ${stats.users_synced ?? 0} users, ${stats.buckets_synced ?? 0} buckets, ${stats.objects_synced ?? 0} objects synced${stats.users_skipped_unregistered ? ` · ${stats.users_skipped_unregistered} unregistered skipped` : ''}${stats.objects_discovered ? ` · ${stats.objects_discovered} discovered` : ''}${stats.object_sync_errors ? ` · ${stats.object_sync_errors} object errors` : ''}`,
+        },
       }))
       await load()
     } catch (err: unknown) {
@@ -161,7 +172,7 @@ function TenantsView() {
     event.preventDefault()
     if (!row.tenant_id) return
     const draft = draftFor(row)
-    const role = row.required_group_name ? 'rw' : draft.role
+    const role = row.access_model === 'rgwsquared_synced' ? 'rw' : draft.role
     const group = row.required_group_name || draft.group.trim()
     if (!group.trim()) return
     setMappingLoading(row.structure)
@@ -223,7 +234,8 @@ function TenantsView() {
                     <div style={{ fontSize: '0.875rem' }}>
                       Synced from RGWSquared: {activateResult.sync_stats.users_synced ?? 0} users,{' '}
                       {activateResult.sync_stats.buckets_synced ?? 0} buckets,{' '}
-                      {activateResult.sync_stats.permissions_synced ?? 0} permissions
+                      {activateResult.sync_stats.permissions_synced ?? 0} permissions,{' '}
+                      {activateResult.sync_stats.objects_synced ?? 0} objects
                     </div>
                   )}
                   {activateResult.sync_error && (
@@ -244,11 +256,24 @@ function TenantsView() {
             ) : (
               <div>
                 <p style={{ color: '#6b7280', marginBottom: '1rem' }}>
-                  This creates the local Django tenant record for <strong>{activating}</strong> and immediately refreshes users and buckets from RGWSquared.
+                  Choose which system owns user enrollment and roles for <strong>{activating}</strong>.
                 </p>
+                <label style={{ display: 'grid', gap: '0.35rem', marginBottom: '1rem' }}>
+                  <span style={{ fontWeight: 600, color: '#334155' }}>Access model</span>
+                  <select
+                    className="admin-select"
+                    value={activationAccessModel}
+                    onChange={(event) => setActivationAccessModel(event.target.value as typeof activationAccessModel)}
+                    disabled={activating.toUpperCase() === 'NFFADI'}
+                  >
+                    <option value="">Select access model…</option>
+                    <option value="rgwsquared_synced">RGWSquared-synced — upstream users and roles</option>
+                    <option value="authentik_managed">Authentik-managed — users and roles at login</option>
+                  </select>
+                </label>
                 {activateError && <div className="error-message" style={{ marginBottom: '0.75rem' }}>{activateError}</div>}
                 <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.5rem' }}>
-                  <button className="btn btn-primary" onClick={handleActivate} disabled={activateLoading}>
+                  <button className="btn btn-primary" onClick={handleActivate} disabled={activateLoading || !activationAccessModel}>
                     {activateLoading ? 'Activating + refreshing…' : 'Activate tenant'}
                   </button>
                   <button className="btn btn-secondary" onClick={() => setActivating(null)} disabled={activateLoading}>Cancel</button>
@@ -281,7 +306,7 @@ function TenantsView() {
                 <div>
                   <h2 style={{ fontSize: '1.1rem', color: '#2c3e50', marginBottom: '0.25rem' }}>{row.structure}</h2>
                   <div style={{ color: '#64748b', fontSize: '0.85rem' }}>
-                    {row.has_tenant ? `${row.member_count} members · ${row.bucket_count} buckets · ${formatSize(row.storage_bytes)}` : 'No local Django tenant yet'}
+                    {row.has_tenant ? `${row.member_count} members · ${row.bucket_count} buckets · ${formatSize(row.storage_bytes)} · ${row.access_model === 'rgwsquared_synced' ? 'RGWSquared-synced' : 'Authentik-managed'}` : 'No local Django tenant yet'}
                   </div>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
@@ -313,7 +338,7 @@ function TenantsView() {
                 {activationStep('RGWSquared structure initialized', initialized, row.initialized === null ? 'status unavailable' : `${row.buckets_auto} auto / ${row.buckets_manual} manual buckets`)}
                 {activationStep('Local Django tenant record exists', row.has_tenant)}
                 {activationStep(
-                  nffadiPolicy ? 'Authentik group mapping ready' : 'Authentik group mapping exists',
+                  row.access_model === 'rgwsquared_synced' ? 'Authentik eligibility mapping ready' : 'Authentik role mapping exists',
                   groupReady,
                   groupReady
                     ? `${row.group_mapping_count} mapping${row.group_mapping_count === 1 ? '' : 's'} · roles from ${row.role_source === 'rgwsquared' ? 'RGWSquared' : 'group mapping'}`
@@ -350,11 +375,11 @@ function TenantsView() {
                 </div>
               )}
 
-              {row.has_tenant && !(nffadiPolicy && row.group_mapping_count > 0) && (
+              {row.has_tenant && !(row.access_model === 'rgwsquared_synced' && row.group_mapping_count > 0) && (
                 <form onSubmit={(event) => handleAddMapping(event, row)} className="admin-add-form" style={{ marginTop: '0.9rem', marginBottom: 0, flexWrap: 'wrap' }}>
-                  {nffadiPolicy ? (
+                  {row.access_model === 'rgwsquared_synced' ? (
                     <span style={{ display: 'inline-flex', alignItems: 'center', minHeight: '38px', color: '#475569', fontSize: '0.85rem' }}>
-                      NFFADI uses one eligibility group; RO/RW comes from RGWSquared.
+                      One eligibility group gates login; RO/RW comes from RGWSquared.
                     </span>
                   ) : (
                     <select
